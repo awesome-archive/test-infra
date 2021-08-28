@@ -42,24 +42,25 @@ func handleGenericComment(c Client, trigger plugins.Trigger, gc github.GenericCo
 	}
 
 	// Skip bot comments.
-	botName, err := c.GitHubClient.BotName()
+	botUserChecker, err := c.GitHubClient.BotUserChecker()
 	if err != nil {
 		return err
 	}
-	if commentAuthor == botName {
+
+	if botUserChecker(commentAuthor) {
 		c.Logger.Debug("Comment is made by the bot, skipping.")
 		return nil
 	}
 
 	refGetter := config.NewRefGetterForGitHubPullRequest(c.GitHubClient, org, repo, number)
-
-	presubmits, err := c.Config.GetPresubmits(c.GitClient, org+"/"+repo, refGetter.BaseSHA, refGetter.HeadSHA)
-	if err != nil {
-		return fmt.Errorf("failed to get presubmits: %v", err)
-	}
+	presubmits := getPresubmits(c.Logger, c.GitClient, c.Config, org+"/"+repo, refGetter.BaseSHA, refGetter.HeadSHA)
 
 	// Skip comments not germane to this plugin
-	if !pjutil.RetestRe.MatchString(gc.Body) && !pjutil.OkToTestRe.MatchString(gc.Body) && !pjutil.TestAllRe.MatchString(gc.Body) {
+	if !pjutil.RetestRe.MatchString(gc.Body) &&
+		!pjutil.RetestRequiredRe.MatchString(gc.Body) &&
+		!pjutil.OkToTestRe.MatchString(gc.Body) &&
+		!pjutil.TestAllRe.MatchString(gc.Body) &&
+		!pjutil.MayNeedHelpComment(gc.Body) {
 		matched := false
 		for _, presubmit := range presubmits {
 			matched = matched || presubmit.TriggerMatches(gc.Body)
@@ -74,10 +75,12 @@ func handleGenericComment(c Client, trigger plugins.Trigger, gc github.GenericCo
 	}
 
 	// Skip untrusted users comments.
-	trusted, err := TrustedUser(c.GitHubClient, trigger.OnlyOrgMembers, trigger.TrustedOrg, commentAuthor, org, repo)
+	trustedResponse, err := TrustedUser(c.GitHubClient, trigger.OnlyOrgMembers, trigger.TrustedOrg, commentAuthor, org, repo)
 	if err != nil {
 		return fmt.Errorf("error checking trust of %s: %v", commentAuthor, err)
 	}
+
+	trusted := trustedResponse.IsTrusted
 	var l []github.Label
 	if !trusted {
 		// Skip untrusted PRs.
@@ -86,7 +89,7 @@ func handleGenericComment(c Client, trigger plugins.Trigger, gc github.GenericCo
 			return err
 		}
 		if !trusted {
-			resp := fmt.Sprintf("Cannot trigger testing until a trusted user reviews the PR and leaves an `/ok-to-test` message.")
+			resp := "Cannot trigger testing until a trusted user reviews the PR and leaves an `/ok-to-test` message."
 			c.Logger.Infof("Commenting \"%s\".", resp)
 			return c.GitHubClient.CreateComment(org, repo, number, plugins.FormatResponseRaw(gc.Body, gc.HTMLURL, gc.User.Login, resp))
 		}
@@ -122,11 +125,14 @@ func handleGenericComment(c Client, trigger plugins.Trigger, gc github.GenericCo
 		return err
 	}
 
-	toTest, toSkip, err := FilterPresubmits(HonorOkToTest(trigger), c.GitHubClient, gc.Body, pr, presubmits, c.Logger)
+	toTest, err := FilterPresubmits(HonorOkToTest(trigger), c.GitHubClient, gc.Body, pr, presubmits, c.Logger)
 	if err != nil {
 		return err
 	}
-	return RunAndSkipJobs(c, pr, baseSHA, toTest, toSkip, gc.GUID, trigger.ElideSkippedContexts)
+	if needsHelp, note := pjutil.ShouldRespondWithHelp(gc.Body, len(toTest)); needsHelp {
+		return addHelpComment(c.GitHubClient, gc.Body, org, repo, pr.Base.Ref, pr.Number, presubmits, gc.HTMLURL, commentAuthor, note, c.Logger)
+	}
+	return RunRequested(c, pr, baseSHA, toTest, gc.GUID)
 }
 
 func HonorOkToTest(trigger plugins.Trigger) bool {
@@ -153,7 +159,7 @@ type GitHubClient interface {
 // If a comment that we get matches more than one of the above patterns, we
 // consider the set of matching presubmits the union of the results from the
 // matching cases.
-func FilterPresubmits(honorOkToTest bool, gitHubClient GitHubClient, body string, pr *github.PullRequest, presubmits []config.Presubmit, logger *logrus.Entry) ([]config.Presubmit, []config.Presubmit, error) {
+func FilterPresubmits(honorOkToTest bool, gitHubClient GitHubClient, body string, pr *github.PullRequest, presubmits []config.Presubmit, logger *logrus.Entry) ([]config.Presubmit, error) {
 	org, repo, sha := pr.Base.Repo.Owner.Login, pr.Base.Repo.Name, pr.Head.SHA
 
 	contextGetter := func() (sets.String, sets.String, error) {
@@ -167,7 +173,7 @@ func FilterPresubmits(honorOkToTest bool, gitHubClient GitHubClient, body string
 
 	filter, err := pjutil.PresubmitFilter(honorOkToTest, contextGetter, body, logger)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	number, branch := pr.Number, pr.Base.Ref
@@ -187,4 +193,15 @@ func getContexts(combinedStatus *github.CombinedStatus) (sets.String, sets.Strin
 		}
 	}
 	return failedContexts, allContexts
+}
+
+func addHelpComment(githubClient githubClient, body, org, repo, branch string, number int, presubmits []config.Presubmit, HTMLURL, user, note string, logger *logrus.Entry) error {
+	changes := config.NewGitHubDeferredChangedFilesProvider(githubClient, org, repo, number)
+	testAllNames, optionalJobsCommands, requiredJobsCommands, err := pjutil.AvailablePresubmits(changes, org, repo, branch, presubmits, logger)
+	if err != nil {
+		return err
+	}
+
+	resp := pjutil.HelpMessage(org, repo, branch, note, testAllNames, optionalJobsCommands, requiredJobsCommands)
+	return githubClient.CreateComment(org, repo, number, plugins.FormatResponseRaw(body, HTMLURL, user, resp))
 }

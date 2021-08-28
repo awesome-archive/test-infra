@@ -20,25 +20,33 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"k8s.io/test-infra/prow/gcsupload"
-	"k8s.io/test-infra/prow/pod-utils/downwardapi"
 	"os"
 	"reflect"
 	"sort"
 	"strings"
 	"testing"
 
+	"k8s.io/apimachinery/pkg/util/sets"
+
+	coreapi "k8s.io/api/core/v1"
+	"k8s.io/test-infra/prow/gcsupload"
+	"k8s.io/test-infra/prow/pod-utils/downwardapi"
+
 	"github.com/fsouza/fake-gcs-server/fakestorage"
 	"github.com/sirupsen/logrus"
-	coreapi "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	tgconf "github.com/GoogleCloudPlatform/testgrid/config"
+	tgconf "github.com/GoogleCloudPlatform/testgrid/pb/config"
+
 	prowapi "k8s.io/test-infra/prow/apis/prowjobs/v1"
 	"k8s.io/test-infra/prow/config"
 	"k8s.io/test-infra/prow/deck/jobs"
+	"k8s.io/test-infra/prow/io"
 	"k8s.io/test-infra/prow/kube"
+	"k8s.io/test-infra/prow/spyglass/api"
 	"k8s.io/test-infra/prow/spyglass/lenses"
+	"k8s.io/test-infra/prow/spyglass/lenses/common"
+	ctrlruntimeclient "sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 var (
@@ -46,21 +54,18 @@ var (
 	fakeGCSServer *fakestorage.Server
 )
 
-const (
-	testSrc = "gs://test-bucket/logs/example-ci-run/403"
-)
-
 type fkc []prowapi.ProwJob
 
-func (f fkc) ListProwJobs(s string) ([]prowapi.ProwJob, error) {
-	return f, nil
+func (f fkc) List(ctx context.Context, pjs *prowapi.ProwJobList, _ ...ctrlruntimeclient.ListOption) error {
+	pjs.Items = f
+	return nil
 }
 
 type fpkc string
 
-func (f fpkc) GetLogs(name string, opts *coreapi.PodLogOptions) ([]byte, error) {
+func (f fpkc) GetLogs(name, container string) ([]byte, error) {
 	if name == "wowowow" || name == "powowow" {
-		return []byte(f), nil
+		return []byte(fmt.Sprintf("%s.%s", f, container)), nil
 	}
 	return nil, fmt.Errorf("pod not found: %s", name)
 }
@@ -104,14 +109,14 @@ test/e2e/e2e.go:137 BeforeSuite on Node 1 failed test/e2e/e2e.go:137
 			BucketName: "test-bucket",
 			Name:       "logs/example-ci-run/403/started.json",
 			Content: []byte(`{
-						  "node": "gke-prow-default-pool-3c8994a8-qfhg", 
-						  "repo-version": "v1.12.0-alpha.0.985+e6f64d0a79243c", 
-						  "timestamp": 1528742858, 
+						  "node": "gke-prow-default-pool-3c8994a8-qfhg",
+						  "repo-version": "v1.12.0-alpha.0.985+e6f64d0a79243c",
+						  "timestamp": 1528742858,
 						  "repos": {
-						    "k8s.io/kubernetes": "master", 
+						    "k8s.io/kubernetes": "master",
 						    "k8s.io/release": "master"
-						  }, 
-						  "version": "v1.12.0-alpha.0.985+e6f64d0a79243c", 
+						  },
+						  "version": "v1.12.0-alpha.0.985+e6f64d0a79243c",
 						  "metadata": {
 						    "pod": "cbc53d8e-6da7-11e8-a4ff-0a580a6c0269"
 						  }
@@ -121,19 +126,19 @@ test/e2e/e2e.go:137 BeforeSuite on Node 1 failed test/e2e/e2e.go:137
 			BucketName: "test-bucket",
 			Name:       "logs/example-ci-run/403/finished.json",
 			Content: []byte(`{
-						  "timestamp": 1528742943, 
-						  "version": "v1.12.0-alpha.0.985+e6f64d0a79243c", 
-						  "result": "SUCCESS", 
-						  "passed": true, 
-						  "job-version": "v1.12.0-alpha.0.985+e6f64d0a79243c", 
+						  "timestamp": 1528742943,
+						  "version": "v1.12.0-alpha.0.985+e6f64d0a79243c",
+						  "result": "SUCCESS",
+						  "passed": true,
+						  "job-version": "v1.12.0-alpha.0.985+e6f64d0a79243c",
 						  "metadata": {
-						    "repo": "k8s.io/kubernetes", 
+						    "repo": "k8s.io/kubernetes",
 						    "repos": {
-						      "k8s.io/kubernetes": "master", 
+						      "k8s.io/kubernetes": "master",
 						      "k8s.io/release": "master"
-						    }, 
-						    "infra-commit": "260081852", 
-						    "pod": "cbc53d8e-6da7-11e8-a4ff-0a580a6c0269", 
+						    },
+						    "infra-commit": "260081852",
+						    "pod": "cbc53d8e-6da7-11e8-a4ff-0a580a6c0269",
 						    "repo-commit": "e6f64d0a79243c834babda494151fc5d66582240"
 						  },
 						},`),
@@ -142,6 +147,11 @@ test/e2e/e2e.go:137 BeforeSuite on Node 1 failed test/e2e/e2e.go:137
 			BucketName: "test-bucket",
 			Name:       "logs/symlink-party/123.txt",
 			Content:    []byte(`gs://test-bucket/logs/the-actual-place/123`),
+		},
+		{
+			BucketName: "multi-container-one-log",
+			Name:       "logs/job/123/test-1-build-log.txt",
+			Content:    []byte("this log exists in gcs!"),
 		},
 	})
 	defer fakeGCSServer.Stop()
@@ -167,9 +177,45 @@ test/e2e/e2e.go:137 BeforeSuite on Node 1 failed test/e2e/e2e.go:137
 				BuildID: "123",
 			},
 		},
+		prowapi.ProwJob{
+			Spec: prowapi.ProwJobSpec{
+				Agent: prowapi.KubernetesAgent,
+				Job:   "example-ci-run",
+				PodSpec: &coreapi.PodSpec{
+					Containers: []coreapi.Container{
+						{
+							Image: "tester",
+						},
+					},
+				},
+			},
+			Status: prowapi.ProwJobStatus{
+				PodName: "wowowow",
+				BuildID: "404",
+			},
+		},
+		prowapi.ProwJob{
+			Spec: prowapi.ProwJobSpec{
+				Agent: prowapi.KubernetesAgent,
+				Job:   "multiple-container-job",
+				PodSpec: &coreapi.PodSpec{
+					Containers: []coreapi.Container{
+						{
+							Name: "test-1",
+						},
+						{
+							Name: "test-2",
+						},
+					},
+				},
+			},
+			Status: prowapi.ProwJobStatus{
+				PodName: "wowowow",
+				BuildID: "123",
+			},
+		},
 	}
-	fca := config.Agent{}
-	fakeJa = jobs.NewJobAgent(kc, map[string]jobs.PodLogClient{kube.DefaultClusterAlias: fpkc("clusterA"), "trusted": fpkc("clusterB")}, fca.Config)
+	fakeJa = jobs.NewJobAgent(context.Background(), kc, false, true, []string{}, map[string]jobs.PodLogClient{kube.DefaultClusterAlias: fpkc("clusterA"), "trusted": fpkc("clusterB")}, fca{}.Config)
 	fakeJa.Start()
 	os.Exit(m.Run())
 }
@@ -183,11 +229,11 @@ func (dumpLens) Config() lenses.LensConfig {
 	}
 }
 
-func (dumpLens) Header(artifacts []lenses.Artifact, resourceDir string, config json.RawMessage) string {
+func (dumpLens) Header(artifacts []api.Artifact, resourceDir string, config json.RawMessage, spyglassConfig config.Spyglass) string {
 	return ""
 }
 
-func (dumpLens) Body(artifacts []lenses.Artifact, resourceDir string, data string, config json.RawMessage) string {
+func (dumpLens) Body(artifacts []api.Artifact, resourceDir string, data string, config json.RawMessage, spyglassConfig config.Spyglass) string {
 	var view []byte
 	for _, a := range artifacts {
 		data, err := a.ReadAll()
@@ -200,7 +246,7 @@ func (dumpLens) Body(artifacts []lenses.Artifact, resourceDir string, data strin
 	return string(view)
 }
 
-func (dumpLens) Callback(artifacts []lenses.Artifact, resourceDir string, data string, config json.RawMessage) string {
+func (dumpLens) Callback(artifacts []api.Artifact, resourceDir string, data string, config json.RawMessage, spyglassConfig config.Spyglass) string {
 	return ""
 }
 
@@ -242,7 +288,7 @@ func TestViews(t *testing.T) {
 					},
 				},
 			}
-			sg := New(fakeJa, c.Config, fakeGCSClient, "", context.Background())
+			sg := New(context.Background(), fakeJa, c.Config, io.NewGCSOpener(fakeGCSClient), false)
 			_, ls := sg.Lenses(tc.lenses)
 			for _, l := range ls {
 				var found bool
@@ -370,8 +416,7 @@ func TestJobPath(t *testing.T) {
 			},
 		},
 	}
-	fca := config.Agent{}
-	fakeJa = jobs.NewJobAgent(kc, map[string]jobs.PodLogClient{kube.DefaultClusterAlias: fpkc("clusterA"), "trusted": fpkc("clusterB")}, fca.Config)
+	fakeJa = jobs.NewJobAgent(context.Background(), kc, false, true, []string{}, map[string]jobs.PodLogClient{kube.DefaultClusterAlias: fpkc("clusterA"), "trusted": fpkc("clusterB")}, fca{}.Config)
 	fakeJa.Start()
 	testCases := []struct {
 		name       string
@@ -382,32 +427,32 @@ func TestJobPath(t *testing.T) {
 		{
 			name:       "non-presubmit job in GCS with trailing /",
 			src:        "gcs/kubernetes-jenkins/logs/example-job-name/123/",
-			expJobPath: "kubernetes-jenkins/logs/example-job-name",
+			expJobPath: "gs/kubernetes-jenkins/logs/example-job-name",
 		},
 		{
 			name:       "non-presubmit job in GCS without trailing /",
 			src:        "gcs/kubernetes-jenkins/logs/example-job-name/123",
-			expJobPath: "kubernetes-jenkins/logs/example-job-name",
+			expJobPath: "gs/kubernetes-jenkins/logs/example-job-name",
 		},
 		{
 			name:       "presubmit job in GCS with trailing /",
 			src:        "gcs/kubernetes-jenkins/pr-logs/pull/test-infra/0000/example-job-name/314159/",
-			expJobPath: "kubernetes-jenkins/pr-logs/directory/example-job-name",
+			expJobPath: "gs/kubernetes-jenkins/pr-logs/directory/example-job-name",
 		},
 		{
 			name:       "presubmit job in GCS without trailing /",
 			src:        "gcs/kubernetes-jenkins/pr-logs/pull/test-infra/0000/example-job-name/314159",
-			expJobPath: "kubernetes-jenkins/pr-logs/directory/example-job-name",
+			expJobPath: "gs/kubernetes-jenkins/pr-logs/directory/example-job-name",
 		},
 		{
 			name:       "non-presubmit Prow job",
 			src:        "prowjob/example-periodic-job/1111",
-			expJobPath: "chum-bucket/logs/example-periodic-job",
+			expJobPath: "gs/chum-bucket/logs/example-periodic-job",
 		},
 		{
 			name:       "Prow presubmit job",
 			src:        "prowjob/example-presubmit-job/2222",
-			expJobPath: "chum-bucket/pr-logs/directory/example-presubmit-job",
+			expJobPath: "gs/chum-bucket/pr-logs/directory/example-presubmit-job",
 		},
 		{
 			name:     "nonexistent job",
@@ -437,8 +482,9 @@ func TestJobPath(t *testing.T) {
 	}
 	for _, tc := range testCases {
 		fakeGCSClient := fakeGCSServer.Client()
+		fakeOpener := io.NewGCSOpener(fakeGCSClient)
 		fca := config.Agent{}
-		sg := New(fakeJa, fca.Config, fakeGCSClient, "", context.Background())
+		sg := New(context.Background(), fakeJa, fca.Config, fakeOpener, false)
 		jobPath, err := sg.JobPath(tc.src)
 		if tc.expError && err == nil {
 			t.Errorf("test %q: JobPath(%q) expected error", tc.name, tc.src)
@@ -511,8 +557,7 @@ func TestProwJobName(t *testing.T) {
 			},
 		},
 	}
-	fca := config.Agent{}
-	fakeJa = jobs.NewJobAgent(kc, map[string]jobs.PodLogClient{kube.DefaultClusterAlias: fpkc("clusterA"), "trusted": fpkc("clusterB")}, fca.Config)
+	fakeJa = jobs.NewJobAgent(context.Background(), kc, false, true, []string{}, map[string]jobs.PodLogClient{kube.DefaultClusterAlias: fpkc("clusterA"), "trusted": fpkc("clusterB")}, fca{}.Config)
 	fakeJa.Start()
 	testCases := []struct {
 		name       string
@@ -551,9 +596,9 @@ func TestProwJobName(t *testing.T) {
 			expJobPath: "",
 		},
 		{
-			name:     "invalid key type",
-			src:      "oh/my/glob/drama/bomb",
-			expError: true,
+			name:       "previously invalid key type is now valid but nonexistent",
+			src:        "oh/my/glob/drama/bomb",
+			expJobPath: "",
 		},
 		{
 			name:     "invalid GCS path",
@@ -563,8 +608,9 @@ func TestProwJobName(t *testing.T) {
 	}
 	for _, tc := range testCases {
 		fakeGCSClient := fakeGCSServer.Client()
+		fakeOpener := io.NewGCSOpener(fakeGCSClient)
 		fca := config.Agent{}
-		sg := New(fakeJa, fca.Config, fakeGCSClient, "", context.Background())
+		sg := New(context.Background(), fakeJa, fca.Config, fakeOpener, false)
 		jobPath, err := sg.ProwJobName(tc.src)
 		if tc.expError && err == nil {
 			t.Errorf("test %q: JobPath(%q) expected error", tc.name, tc.src)
@@ -624,8 +670,7 @@ func TestRunPath(t *testing.T) {
 			},
 		},
 	}
-	fca := config.Agent{}
-	fakeJa = jobs.NewJobAgent(kc, map[string]jobs.PodLogClient{kube.DefaultClusterAlias: fpkc("clusterA"), "trusted": fpkc("clusterB")}, fca.Config)
+	fakeJa = jobs.NewJobAgent(context.Background(), kc, false, true, []string{}, map[string]jobs.PodLogClient{kube.DefaultClusterAlias: fpkc("clusterA"), "trusted": fpkc("clusterB")}, fca{}.Config)
 	fakeJa.Start()
 	testCases := []struct {
 		name       string
@@ -669,9 +714,9 @@ func TestRunPath(t *testing.T) {
 			expError: true,
 		},
 		{
-			name:     "invalid key type",
-			src:      "oh/my/glob/drama/bomb",
-			expError: true,
+			name:       "previously invalid key type is now valid",
+			src:        "oh/my/glob/drama/bomb",
+			expRunPath: "my/glob/drama/bomb",
 		},
 		{
 			name:     "nonsense string errors",
@@ -681,6 +726,7 @@ func TestRunPath(t *testing.T) {
 	}
 	for _, tc := range testCases {
 		fakeGCSClient := fakeGCSServer.Client()
+		fakeOpener := io.NewGCSOpener(fakeGCSClient)
 		fca := config.Agent{}
 		fca.Set(&config.Config{
 			ProwConfig: config.ProwConfig{
@@ -689,7 +735,7 @@ func TestRunPath(t *testing.T) {
 				},
 			},
 		})
-		sg := New(fakeJa, fca.Config, fakeGCSClient, "", context.Background())
+		sg := New(context.Background(), fakeJa, fca.Config, fakeOpener, false)
 		jobPath, err := sg.RunPath(tc.src)
 		if tc.expError && err == nil {
 			t.Errorf("test %q: RunPath(%q) expected error, got  %q", tc.name, tc.src, jobPath)
@@ -748,8 +794,7 @@ func TestRunToPR(t *testing.T) {
 			},
 		},
 	}
-	fca := config.Agent{}
-	fakeJa = jobs.NewJobAgent(kc, map[string]jobs.PodLogClient{kube.DefaultClusterAlias: fpkc("clusterA"), "trusted": fpkc("clusterB")}, fca.Config)
+	fakeJa = jobs.NewJobAgent(context.Background(), kc, false, true, []string{}, map[string]jobs.PodLogClient{kube.DefaultClusterAlias: fpkc("clusterA"), "trusted": fpkc("clusterB")}, fca{}.Config)
 	fakeJa.Start()
 	testCases := []struct {
 		name      string
@@ -836,18 +881,21 @@ func TestRunToPR(t *testing.T) {
 		fca.Set(&config.Config{
 			ProwConfig: config.ProwConfig{
 				Plank: config.Plank{
-					DefaultDecorationConfig: &prowapi.DecorationConfig{
-						GCSConfiguration: &prowapi.GCSConfiguration{
-							Bucket:       "kubernetes-jenkins",
-							DefaultOrg:   "kubernetes",
-							DefaultRepo:  "kubernetes",
-							PathStrategy: "legacy",
-						},
-					},
+					DefaultDecorationConfigs: config.DefaultDecorationMapToSliceTesting(
+						map[string]*prowapi.DecorationConfig{
+							"*": {
+								GCSConfiguration: &prowapi.GCSConfiguration{
+									Bucket:       "kubernetes-jenkins",
+									DefaultOrg:   "kubernetes",
+									DefaultRepo:  "kubernetes",
+									PathStrategy: "legacy",
+								},
+							},
+						}),
 				},
 			},
 		})
-		sg := New(fakeJa, fca.Config, fakeGCSClient, "", context.Background())
+		sg := New(context.Background(), fakeJa, fca.Config, io.NewGCSOpener(fakeGCSClient), false)
 		org, repo, num, err := sg.RunToPR(tc.src)
 		if tc.expError && err == nil {
 			t.Errorf("test %q: RunToPR(%q) expected error", tc.name, tc.src)
@@ -932,11 +980,11 @@ func TestProwToGCS(t *testing.T) {
 				},
 			},
 		}
-		fakeJa = jobs.NewJobAgent(kc, map[string]jobs.PodLogClient{kube.DefaultClusterAlias: fpkc("clusterA"), "trusted": fpkc("clusterB")}, fakeConfigAgent.Config)
+		fakeJa = jobs.NewJobAgent(context.Background(), kc, false, true, []string{}, map[string]jobs.PodLogClient{kube.DefaultClusterAlias: fpkc("clusterA"), "trusted": fpkc("clusterB")}, fakeConfigAgent.Config)
 		fakeJa.Start()
-		sg := New(fakeJa, fakeConfigAgent.Config, fakeGCSClient, "", context.Background())
+		sg := New(context.Background(), fakeJa, fakeConfigAgent.Config, io.NewGCSOpener(fakeGCSClient), false)
 
-		p, err := sg.prowToGCS(tc.key)
+		_, p, err := sg.prowToGCS(tc.key)
 		if err != nil && !tc.expectError {
 			t.Errorf("test %q: unexpected error: %v", tc.key, err)
 			continue
@@ -1052,22 +1100,25 @@ func TestGCSPathRoundTrip(t *testing.T) {
 			c: config.Config{
 				ProwConfig: config.ProwConfig{
 					Plank: config.Plank{
-						DefaultDecorationConfig: &prowapi.DecorationConfig{
-							GCSConfiguration: &prowapi.GCSConfiguration{
-								DefaultOrg:  tc.defaultOrg,
-								DefaultRepo: tc.defaultRepo,
-							},
-						},
+						DefaultDecorationConfigs: config.DefaultDecorationMapToSliceTesting(
+							map[string]*prowapi.DecorationConfig{
+								"*": {
+									GCSConfiguration: &prowapi.GCSConfiguration{
+										DefaultOrg:  tc.defaultOrg,
+										DefaultRepo: tc.defaultRepo,
+									},
+								},
+							}),
 					},
 				},
 			},
 		}
-		fakeJa = jobs.NewJobAgent(kc, map[string]jobs.PodLogClient{kube.DefaultClusterAlias: fpkc("clusterA")}, fakeConfigAgent.Config)
+		fakeJa = jobs.NewJobAgent(context.Background(), kc, false, true, []string{}, map[string]jobs.PodLogClient{kube.DefaultClusterAlias: fpkc("clusterA"), "trusted": fpkc("clusterB")}, fakeConfigAgent.Config)
 		fakeJa.Start()
 
 		fakeGCSClient := fakeGCSServer.Client()
 
-		sg := New(fakeJa, fakeConfigAgent.Config, fakeGCSClient, "", context.Background())
+		sg := New(context.Background(), fakeJa, fakeConfigAgent.Config, io.NewGCSOpener(fakeGCSClient), false)
 		gcspath, _, _ := gcsupload.PathsForJob(
 			&prowapi.GCSConfiguration{Bucket: "test-bucket", PathStrategy: tc.pathStrategy},
 			&downwardapi.JobSpec{
@@ -1141,8 +1192,7 @@ func TestTestGridLink(t *testing.T) {
 	}
 
 	kc := fkc{}
-	fca := config.Agent{}
-	fakeJa = jobs.NewJobAgent(kc, map[string]jobs.PodLogClient{kube.DefaultClusterAlias: fpkc("clusterA"), "trusted": fpkc("clusterB")}, fca.Config)
+	fakeJa = jobs.NewJobAgent(context.Background(), kc, false, true, []string{}, map[string]jobs.PodLogClient{kube.DefaultClusterAlias: fpkc("clusterA"), "trusted": fpkc("clusterB")}, fca{}.Config)
 	fakeJa.Start()
 
 	tg := TestGrid{c: &tgconf.Configuration{
@@ -1179,7 +1229,7 @@ func TestTestGridLink(t *testing.T) {
 				},
 			},
 		})
-		sg := New(fakeJa, fca.Config, fakeGCSClient, "", context.Background())
+		sg := New(context.Background(), fakeJa, fca.Config, io.NewGCSOpener(fakeGCSClient), false)
 		sg.testgrid = &tg
 		link, err := sg.TestGridLink(tc.src)
 		if tc.expError {
@@ -1211,22 +1261,36 @@ func TestFetchArtifactsPodLog(t *testing.T) {
 				URL:     "https://gubernator.example.com/build/job/123",
 			},
 		},
+		prowapi.ProwJob{
+			Spec: prowapi.ProwJobSpec{
+				Agent: prowapi.KubernetesAgent,
+				Job:   "multi-container-one-log",
+			},
+			Status: prowapi.ProwJobStatus{
+				PodName: "wowowow",
+				BuildID: "123",
+				URL:     "https://gubernator.example.com/build/multi-container/123",
+			},
+		},
 	}
 	fakeConfigAgent := fca{
 		c: config.Config{
 			ProwConfig: config.ProwConfig{
+				Deck: config.Deck{
+					AllKnownStorageBuckets: sets.NewString("job", "kubernetes-jenkins", "multi-container-one-log"),
+				},
 				Plank: config.Plank{
 					JobURLPrefixConfig: map[string]string{"*": "https://gubernator.example.com/build/"},
 				},
 			},
 		},
 	}
-	fakeJa = jobs.NewJobAgent(kc, map[string]jobs.PodLogClient{kube.DefaultClusterAlias: fpkc("clusterA")}, fakeConfigAgent.Config)
+	fakeJa = jobs.NewJobAgent(context.Background(), kc, false, true, []string{}, map[string]jobs.PodLogClient{kube.DefaultClusterAlias: fpkc("clusterA"), "trusted": fpkc("clusterB")}, fakeConfigAgent.Config)
 	fakeJa.Start()
 
 	fakeGCSClient := fakeGCSServer.Client()
 
-	sg := New(fakeJa, fakeConfigAgent.Config, fakeGCSClient, "", context.Background())
+	sg := New(context.Background(), fakeJa, fakeConfigAgent.Config, io.NewGCSOpener(fakeGCSClient), false)
 	testKeys := []string{
 		"prowjob/job/123",
 		"gcs/kubernetes-jenkins/logs/job/123/",
@@ -1234,7 +1298,7 @@ func TestFetchArtifactsPodLog(t *testing.T) {
 	}
 
 	for _, key := range testKeys {
-		result, err := sg.FetchArtifacts(key, "", 500e6, []string{"build-log.txt"})
+		result, err := sg.FetchArtifacts(context.Background(), key, "", 500e6, []string{"build-log.txt"})
 		if err != nil {
 			t.Errorf("Unexpected error grabbing pod log for %s: %v", key, err)
 			continue
@@ -1248,8 +1312,35 @@ func TestFetchArtifactsPodLog(t *testing.T) {
 			t.Errorf("Unexpected error reading pod log for %s: %v", key, err)
 			continue
 		}
-		if string(content) != "clusterA" {
+		if string(content) != fmt.Sprintf("clusterA.%s", kube.TestContainerName) {
 			t.Errorf("Bad pod log content for %s: %q (expected 'clusterA')", key, content)
+		}
+	}
+
+	multiContainerOneLogKey := "gcs/multi-container-one-log/logs/job/123"
+
+	testKeys = append(testKeys, multiContainerOneLogKey)
+
+	for _, key := range testKeys {
+		containers := []string{"test-1", "test-2"}
+		result, err := sg.FetchArtifacts(context.Background(), key, "", 500e6, []string{fmt.Sprintf("%s-%s", containers[0], singleLogName), fmt.Sprintf("%s-%s", containers[1], singleLogName)})
+		if err != nil {
+			t.Errorf("Unexpected error grabbing pod log for %s: %v", key, err)
+			continue
+		}
+		for i, art := range result {
+			content, err := art.ReadAll()
+			if err != nil {
+				t.Errorf("Unexpected error reading pod log for %s: %v", key, err)
+				continue
+			}
+			expected := fmt.Sprintf("clusterA.%s", containers[i])
+			if key == multiContainerOneLogKey && containers[i] == "test-1" {
+				expected = "this log exists in gcs!"
+			}
+			if string(content) != expected {
+				t.Errorf("Bad pod log content for %s: %q (expected '%s')", key, content, expected)
+			}
 		}
 	}
 }
@@ -1306,8 +1397,7 @@ func TestKeyToJob(t *testing.T) {
 	}
 
 	for _, tc := range testCases {
-		sg := Spyglass{}
-		jobName, buildID, err := sg.KeyToJob(tc.path)
+		jobName, buildID, err := common.KeyToJob(tc.path)
 		if err != nil {
 			if !tc.expectErr {
 				t.Errorf("%s: unexpected error %v", tc.name, err)
@@ -1338,22 +1428,22 @@ func TestResolveSymlink(t *testing.T) {
 		{
 			name:   "symlink without trailing slash is resolved",
 			path:   "gcs/test-bucket/logs/symlink-party/123",
-			result: "gcs/test-bucket/logs/the-actual-place/123",
+			result: "gs/test-bucket/logs/the-actual-place/123",
 		},
 		{
 			name:   "symlink with trailing slash is resolved",
 			path:   "gcs/test-bucket/logs/symlink-party/123/",
-			result: "gcs/test-bucket/logs/the-actual-place/123",
+			result: "gs/test-bucket/logs/the-actual-place/123",
 		},
 		{
 			name:   "non-symlink without trailing slash is unchanged",
 			path:   "gcs/test-bucket/better-logs/42",
-			result: "gcs/test-bucket/better-logs/42",
+			result: "gs/test-bucket/better-logs/42",
 		},
 		{
 			name:   "non-symlink with trailing slash drops the slash",
 			path:   "gcs/test-bucket/better-logs/42/",
-			result: "gcs/test-bucket/better-logs/42",
+			result: "gs/test-bucket/better-logs/42",
 		},
 		{
 			name:   "prowjob without trailing slash is unchanged",
@@ -1379,12 +1469,12 @@ func TestResolveSymlink(t *testing.T) {
 
 	for _, tc := range testCases {
 		fakeConfigAgent := fca{}
-		fakeJa = jobs.NewJobAgent(fkc{}, map[string]jobs.PodLogClient{kube.DefaultClusterAlias: fpkc("clusterA")}, fakeConfigAgent.Config)
+		fakeJa = jobs.NewJobAgent(context.Background(), fkc{}, false, true, []string{}, map[string]jobs.PodLogClient{kube.DefaultClusterAlias: fpkc("clusterA"), "trusted": fpkc("clusterB")}, fakeConfigAgent.Config)
 		fakeJa.Start()
 
 		fakeGCSClient := fakeGCSServer.Client()
 
-		sg := New(fakeJa, fakeConfigAgent.Config, fakeGCSClient, "", context.Background())
+		sg := New(context.Background(), fakeJa, fakeConfigAgent.Config, io.NewGCSOpener(fakeGCSClient), false)
 
 		result, err := sg.ResolveSymlink(tc.path)
 		if err != nil {
@@ -1456,7 +1546,6 @@ func TestExtraLinks(t *testing.T) {
 			links:   []ExtraLink{{Name: "A", URL: "http://a", Description: "A!"}, {Name: "B", URL: "http://b"}},
 		},
 	}
-
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			var objects []fakestorage.Object
@@ -1473,12 +1562,20 @@ func TestExtraLinks(t *testing.T) {
 			defer gcsServer.Stop()
 
 			gcsClient := gcsServer.Client()
-			fakeConfigAgent := fca{}
-			fakeJa = jobs.NewJobAgent(fkc{}, map[string]jobs.PodLogClient{kube.DefaultClusterAlias: fpkc("clusterA")}, fakeConfigAgent.Config)
+			fakeConfigAgent := fca{
+				c: config.Config{
+					ProwConfig: config.ProwConfig{
+						Deck: config.Deck{
+							AllKnownStorageBuckets: sets.NewString("test-bucket"),
+						},
+					},
+				},
+			}
+			fakeJa = jobs.NewJobAgent(context.Background(), fkc{}, false, true, []string{}, map[string]jobs.PodLogClient{kube.DefaultClusterAlias: fpkc("clusterA"), "trusted": fpkc("clusterB")}, fakeConfigAgent.Config)
 			fakeJa.Start()
-			sg := New(fakeJa, fakeConfigAgent.Config, gcsClient, "", context.Background())
+			sg := New(context.Background(), fakeJa, fakeConfigAgent.Config, io.NewGCSOpener(gcsClient), false)
 
-			result, err := sg.ExtraLinks("gcs/test-bucket/logs/some-job/42")
+			result, err := sg.ExtraLinks(context.Background(), "gcs/test-bucket/logs/some-job/42")
 			if err != nil {
 				if !tc.expectErr {
 					t.Fatalf("unexpected error: %v", err)

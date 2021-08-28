@@ -20,6 +20,9 @@ import (
 	"flag"
 	"reflect"
 	"testing"
+
+	prowflagutil "k8s.io/test-infra/prow/flagutil"
+	configflagutil "k8s.io/test-infra/prow/flagutil/config"
 )
 
 func TestOptions(t *testing.T) {
@@ -29,21 +32,21 @@ func TestOptions(t *testing.T) {
 		expected *options
 		err      bool
 	}{{
-		name:     "defaults work",
+		name:     "defaults don't work (set --config to prow config.yaml file)",
 		expected: &options{},
+		err:      true,
 	}, {
-		name: "error when providing both kubedonfig and build-cluter options ",
-		args: []string{"--all-contexts=true", "--tot-url=https://tot",
-			"--kubeconfig=/root/kubeconfig", "--config=/etc/config.yaml",
-			"--build-cluster=/etc/build-cluster.yaml"},
+		name: "only config works",
+		args: []string{"--config=/etc/config.yaml"},
 		expected: &options{
-			allContexts:  true,
-			totURL:       "https://tot",
-			kubeconfig:   "/root/kubeconfig",
-			config:       "/etc/config.yaml",
-			buildCluster: "/etc/build-cluster.yaml",
+			config: configflagutil.ConfigOptions{
+				ConfigPathFlagName:                    "config",
+				ConfigPath:                            "/etc/config.yaml",
+				JobConfigPathFlagName:                 "job-config-path",
+				SupplementalProwConfigsFileNameSuffix: "_prowconfig.yaml",
+			},
+			instrumentationOptions: prowflagutil.DefaultInstrumentationOptions(),
 		},
-		err: true,
 	}, {
 		name: "parse all arguments",
 		args: []string{"--all-contexts=true", "--tot-url=https://tot",
@@ -52,7 +55,13 @@ func TestOptions(t *testing.T) {
 			allContexts: true,
 			totURL:      "https://tot",
 			kubeconfig:  "/root/kubeconfig",
-			config:      "/etc/config.yaml",
+			config: configflagutil.ConfigOptions{
+				ConfigPathFlagName:                    "config",
+				ConfigPath:                            "/etc/config.yaml",
+				JobConfigPathFlagName:                 "job-config-path",
+				SupplementalProwConfigsFileNameSuffix: "_prowconfig.yaml",
+			},
+			instrumentationOptions: prowflagutil.DefaultInstrumentationOptions(),
 		},
 	}}
 	for _, tc := range cases {

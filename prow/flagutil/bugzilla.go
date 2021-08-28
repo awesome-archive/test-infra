@@ -29,13 +29,15 @@ import (
 
 // BugzillaOptions holds options for interacting with Bugzilla.
 type BugzillaOptions struct {
-	endpoint   string
-	ApiKeyPath string
+	endpoint                string
+	githubExternalTrackerId uint
+	ApiKeyPath              string
 }
 
 // AddFlags injects Bugzilla options into the given FlagSet.
 func (o *BugzillaOptions) AddFlags(fs *flag.FlagSet) {
 	fs.StringVar(&o.endpoint, "bugzilla-endpoint", "", "Bugzilla's API endpoint.")
+	fs.UintVar(&o.githubExternalTrackerId, "bugzilla-github-external-tracker-id", 0, "The ext_type_id for GitHub external bugs, optional.")
 	fs.StringVar(&o.ApiKeyPath, "bugzilla-api-key-path", "", "Path to the file containing the Bugzilla API key.")
 }
 
@@ -58,7 +60,7 @@ func (o *BugzillaOptions) Validate(dryRun bool) error {
 }
 
 // BugzillaClient returns a Bugzilla client.
-func (o *BugzillaOptions) BugzillaClient(secretAgent *secret.Agent) (bugzilla.Client, error) {
+func (o *BugzillaOptions) BugzillaClient() (bugzilla.Client, error) {
 	if o.endpoint == "" {
 		return nil, fmt.Errorf("empty -bugzilla-endpoint, cannot create Bugzilla client")
 	}
@@ -70,12 +72,9 @@ func (o *BugzillaOptions) BugzillaClient(secretAgent *secret.Agent) (bugzilla.Cl
 		}
 		generator = &generatorFunc
 	} else {
-		if secretAgent == nil {
-			return nil, fmt.Errorf("cannot store token from %q without a secret agent", o.ApiKeyPath)
-		}
-		generatorFunc := secretAgent.GetTokenGenerator(o.ApiKeyPath)
+		generatorFunc := secret.GetTokenGenerator(o.ApiKeyPath)
 		generator = &generatorFunc
 	}
 
-	return bugzilla.NewClient(*generator, o.endpoint), nil
+	return bugzilla.NewClient(*generator, o.endpoint, o.githubExternalTrackerId), nil
 }

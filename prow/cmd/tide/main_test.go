@@ -22,8 +22,9 @@ import (
 	"testing"
 
 	"k8s.io/apimachinery/pkg/util/sets"
-	"k8s.io/test-infra/prow/config"
+
 	"k8s.io/test-infra/prow/flagutil"
+	configflagutil "k8s.io/test-infra/prow/flagutil/config"
 )
 
 func Test_gatherOptions(t *testing.T) {
@@ -43,16 +44,7 @@ func Test_gatherOptions(t *testing.T) {
 				"--config-path": "/random/value",
 			},
 			expected: func(o *options) {
-				o.configPath = "/random/value"
-			},
-		},
-		{
-			name: "empty config-path defaults to old value",
-			args: map[string]string{
-				"--config-path": "",
-			},
-			expected: func(o *options) {
-				o.configPath = config.DefaultConfigPath
+				o.config.ConfigPath = "/random/value"
 			},
 		},
 		{
@@ -62,6 +54,28 @@ func Test_gatherOptions(t *testing.T) {
 			},
 			expected: func(o *options) {
 				o.dryRun = false
+			},
+		},
+		{
+			name: "gcs-credentials-file sets the credentials on the storage client",
+			args: map[string]string{
+				"-gcs-credentials-file": "/creds",
+			},
+			expected: func(o *options) {
+				o.storage = flagutil.StorageClientOptions{
+					GCSCredentialsFile: "/creds",
+				}
+			},
+		},
+		{
+			name: "s3-credentials-file sets the credentials on the storage client",
+			args: map[string]string{
+				"-s3-credentials-file": "/creds",
+			},
+			expected: func(o *options) {
+				o.storage = flagutil.StorageClientOptions{
+					S3CredentialsFile: "/creds",
+				}
 			},
 		},
 		{
@@ -77,15 +91,19 @@ func Test_gatherOptions(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			expected := &options{
-				port:              8888,
-				configPath:        "yo",
-				jobConfigPath:     "",
-				dryRun:            true,
-				syncThrottle:      800,
-				statusThrottle:    400,
-				maxRecordsPerPool: 1000,
-				github:            flagutil.GitHubOptions{},
-				kubernetes:        flagutil.KubernetesOptions{DeckURI: "http://whatever"},
+				port: 8888,
+				config: configflagutil.ConfigOptions{
+					ConfigPathFlagName:                    "config-path",
+					JobConfigPathFlagName:                 "job-config-path",
+					ConfigPath:                            "yo",
+					SupplementalProwConfigsFileNameSuffix: "_prowconfig.yaml",
+				},
+				dryRun:                 true,
+				syncThrottle:           800,
+				statusThrottle:         400,
+				maxRecordsPerPool:      1000,
+				kubernetes:             flagutil.KubernetesOptions{DeckURI: "http://whatever"},
+				instrumentationOptions: flagutil.DefaultInstrumentationOptions(),
 			}
 			expectedfs := flag.NewFlagSet("fake-flags", flag.PanicOnError)
 			expected.github.AddFlags(expectedfs)

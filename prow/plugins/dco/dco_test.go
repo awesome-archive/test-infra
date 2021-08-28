@@ -32,10 +32,6 @@ type fakePruner struct{}
 
 func (fp *fakePruner) PruneComments(shouldPrune func(github.IssueComment) bool) {}
 
-func strP(str string) *string {
-	return &str
-}
-
 func TestHandlePullRequest(t *testing.T) {
 	var testcases = []struct {
 		// test settings
@@ -294,6 +290,39 @@ Instructions for interacting with me using PR comments are available [here](http
 			expectedStatus: github.StatusSuccess,
 		},
 		{
+			name: "should add label and update status context if one commit is signed-off and another is from a trusted user",
+			config: plugins.Dco{
+				SkipDCOCheckForMembers: true,
+				TrustedOrg:             "kubernetes",
+			},
+			pullRequestEvent: github.PullRequestEvent{
+				Action:      github.PullRequestActionOpened,
+				PullRequest: github.PullRequest{Number: 3, Head: github.PullRequestBranch{SHA: "sha"}},
+			},
+			commits: []github.RepositoryCommit{
+				{
+					SHA:    "sha",
+					Commit: github.GitCommit{Message: "not signed off"},
+					Author: github.User{
+						Login: "test",
+					},
+				},
+				{
+					SHA:    "sha2",
+					Commit: github.GitCommit{Message: "Signed-off-by: someone"},
+					Author: github.User{
+						Login: "contributor",
+					},
+				},
+			},
+			issueState: "open",
+			hasDCONo:   false,
+			hasDCOYes:  false,
+
+			addedLabel:     fmt.Sprintf("/#3:%s", dcoYesLabel),
+			expectedStatus: github.StatusSuccess,
+		},
+		{
 			name: "should fail dco check as one unsigned commit is from member not from the trusted org",
 			config: plugins.Dco{
 				SkipDCOCheckForMembers: true,
@@ -502,19 +531,18 @@ Instructions for interacting with me using PR comments are available [here](http
 	}
 	for _, tc := range testcases {
 		t.Run(tc.name, func(t *testing.T) {
-			fc := &fakegithub.FakeClient{
-				CombinedStatuses: make(map[string]*github.CombinedStatus),
-				CreatedStatuses:  make(map[string][]github.Status),
-				PullRequests:     map[int]*github.PullRequest{tc.pullRequestEvent.PullRequest.Number: &tc.pullRequestEvent.PullRequest},
-				IssueComments:    make(map[int][]github.IssueComment),
-				CommitMap: map[string][]github.RepositoryCommit{
-					"/#3": tc.commits,
-				},
-				OrgMembers: map[string][]string{
-					"kubernetes": {"test"},
-				},
-				Collaborators: []string{"test-collaborator"},
+			fc := fakegithub.NewFakeClient()
+			fc.CombinedStatuses = make(map[string]*github.CombinedStatus)
+			fc.CreatedStatuses = make(map[string][]github.Status)
+			fc.PullRequests = map[int]*github.PullRequest{tc.pullRequestEvent.PullRequest.Number: &tc.pullRequestEvent.PullRequest}
+			fc.IssueComments = make(map[int][]github.IssueComment)
+			fc.CommitMap = map[string][]github.RepositoryCommit{
+				"/#3": tc.commits,
 			}
+			fc.OrgMembers = map[string][]string{
+				"kubernetes": {"test"},
+			}
+			fc.Collaborators = []string{"test-collaborator"}
 			if tc.hasDCOYes {
 				fc.IssueLabelsAdded = append(fc.IssueLabelsAdded, fmt.Sprintf("/#3:%s", dcoYesLabel))
 			}
@@ -706,17 +734,16 @@ Instructions for interacting with me using PR comments are available [here](http
 	}
 	for _, tc := range testcases {
 		t.Run(tc.name, func(t *testing.T) {
-			fc := &fakegithub.FakeClient{
-				CreatedStatuses:  make(map[string][]github.Status),
-				CombinedStatuses: make(map[string]*github.CombinedStatus),
-				PullRequests:     tc.pullRequests,
-				IssueComments:    make(map[int][]github.IssueComment),
-				CommitMap: map[string][]github.RepositoryCommit{
-					"/#3": tc.commits,
-				},
-				OrgMembers: map[string][]string{
-					"kubernetes": {"test"},
-				},
+			fc := fakegithub.NewFakeClient()
+			fc.CreatedStatuses = make(map[string][]github.Status)
+			fc.CombinedStatuses = make(map[string]*github.CombinedStatus)
+			fc.PullRequests = tc.pullRequests
+			fc.IssueComments = make(map[int][]github.IssueComment)
+			fc.CommitMap = map[string][]github.RepositoryCommit{
+				"/#3": tc.commits,
+			}
+			fc.OrgMembers = map[string][]string{
+				"kubernetes": {"test"},
 			}
 			if tc.hasDCOYes {
 				fc.IssueLabelsAdded = append(fc.IssueLabelsAdded, fmt.Sprintf("/#3:%s", dcoYesLabel))

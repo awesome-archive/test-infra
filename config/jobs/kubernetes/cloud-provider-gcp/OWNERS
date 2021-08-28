@@ -1,6 +1,13 @@
 # See the OWNERS docs at https://go.k8s.io/owners
 
-approvers:
-- awly
+reviewers:
+- amwat
 - mikedanese
-- calebmiles
+- jpbetz
+approvers:
+- amwat
+- mikedanese
+- jpbetz
+labels:
+- sig/cloud-provider
+- area/provider/aws

@@ -22,7 +22,7 @@ import (
 	"os"
 	"testing"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
 
 	cfg "k8s.io/test-infra/prow/config"
@@ -41,7 +41,7 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 
-	conf, err := cfg.Load(*configPath, *jobConfigPath)
+	conf, err := cfg.Load(*configPath, *jobConfigPath, nil, "")
 	if err != nil {
 		fmt.Printf("Could not load config: %v", err)
 		os.Exit(1)
@@ -95,12 +95,12 @@ func missingMountsForSpec(spec *v1.PodSpec) sets.String {
 
 // verify that all volume mounts reference volumes that exist
 func TestMountsHaveVolumes(t *testing.T) {
-	for _, job := range c.AllPresubmits(nil) {
+	for _, job := range c.AllStaticPresubmits(nil) {
 		if job.Spec != nil {
 			validateVolumesAndMounts(job.Name, job.Spec, t)
 		}
 	}
-	for _, job := range c.AllPostsubmits(nil) {
+	for _, job := range c.AllStaticPostsubmits(nil) {
 		if job.Spec != nil {
 			validateVolumesAndMounts(job.Name, job.Spec, t)
 		}
@@ -130,7 +130,7 @@ func checkContext(t *testing.T, repo string, p cfg.Presubmit) {
 }
 
 func TestContextMatches(t *testing.T) {
-	for repo, presubmits := range c.Presubmits {
+	for repo, presubmits := range c.PresubmitsStatic {
 		for _, p := range presubmits {
 			checkContext(t, repo, p)
 		}
@@ -147,7 +147,7 @@ func checkRetest(t *testing.T, repo string, presubmits []cfg.Presubmit) {
 }
 
 func TestRetestMatchJobsName(t *testing.T) {
-	for repo, presubmits := range c.Presubmits {
+	for repo, presubmits := range c.PresubmitsStatic {
 		checkRetest(t, repo, presubmits)
 	}
 }
@@ -156,69 +156,4 @@ func TestRetestMatchJobsName(t *testing.T) {
 type SubmitQueueConfig struct {
 	// this is the only field we need for the tests below
 	RequiredRetestContexts string `json:"required-retest-contexts"`
-}
-
-func findRequired(t *testing.T, presubmits []cfg.Presubmit) []string {
-	var required []string
-	for _, p := range presubmits {
-		if !p.AlwaysRun {
-			continue
-		}
-		if p.SkipReport {
-			continue
-		}
-		required = append(required, p.Context)
-	}
-	return required
-}
-
-// Load the config and extract all jobs
-func allJobs() ([]cfg.Presubmit, []cfg.Postsubmit, []cfg.Periodic, error) {
-	pres := []cfg.Presubmit{}
-	posts := []cfg.Postsubmit{}
-	peris := []cfg.Periodic{}
-
-	{ // Find all presubmit jobs
-		q := []cfg.Presubmit{}
-
-		for _, p := range c.Presubmits {
-			for _, p2 := range p {
-				q = append(q, p2)
-			}
-		}
-
-		for len(q) > 0 {
-			pres = append(pres, q[0])
-			q = q[1:]
-		}
-	}
-
-	{ // Find all postsubmit jobs
-		q := []cfg.Postsubmit{}
-
-		for _, p := range c.Postsubmits {
-			for _, p2 := range p {
-				q = append(q, p2)
-			}
-		}
-
-		for len(q) > 0 {
-			posts = append(posts, q[0])
-			q = q[1:]
-		}
-	}
-
-	{ // Find all periodic jobs
-		q := []cfg.Periodic{}
-		for _, p := range c.Periodics {
-			q = append(q, p)
-		}
-
-		for len(q) > 0 {
-			peris = append(peris, q[0])
-			q = q[1:]
-		}
-	}
-
-	return pres, posts, peris, nil
 }

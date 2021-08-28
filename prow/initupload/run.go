@@ -18,6 +18,7 @@ package initupload
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -26,7 +27,7 @@ import (
 	"strconv"
 	"time"
 
-	prowapi "k8s.io/test-infra/prow/apis/prowjobs/v1"
+	prowv1 "k8s.io/test-infra/prow/apis/prowjobs/v1"
 	"k8s.io/test-infra/prow/pod-utils/clone"
 	"k8s.io/test-infra/prow/pod-utils/downwardapi"
 	"k8s.io/test-infra/prow/pod-utils/gcs"
@@ -35,16 +36,22 @@ import (
 // specToStarted translate a jobspec into a started struct
 // optionally overwrite RepoVersion with provided cloneRecords
 func specToStarted(spec *downwardapi.JobSpec, cloneRecords []clone.Record) gcs.Started {
+	var version string
+
 	started := gcs.Started{
 		Timestamp: time.Now().Unix(),
 	}
 
 	if mainRefs := spec.MainRefs(); mainRefs != nil {
-		started.RepoVersion = shaForRefs(*mainRefs, cloneRecords)
+		version = shaForRefs(*mainRefs, cloneRecords)
 	}
-	if started.RepoVersion == "" {
-		started.RepoVersion = downwardapi.GetRevisionFromSpec(spec)
+
+	if version == "" {
+		version = downwardapi.GetRevisionFromSpec(spec)
 	}
+
+	started.DeprecatedRepoVersion = version
+	started.RepoCommit = version
 
 	// TODO(fejta): VM name
 
@@ -65,7 +72,7 @@ func specToStarted(spec *downwardapi.JobSpec, cloneRecords []clone.Record) gcs.S
 }
 
 // shaForRefs finds the resolved SHA after cloning and merging for the given refs
-func shaForRefs(refs prowapi.Refs, cloneRecords []clone.Record) string {
+func shaForRefs(refs prowv1.Refs, cloneRecords []clone.Record) string {
 	for _, record := range cloneRecords {
 		if reflect.DeepEqual(refs, record.Refs) {
 			return record.FinalSHA
@@ -98,10 +105,11 @@ func (o Options) Run() error {
 		return fmt.Errorf("could not marshal starting data: %v", err)
 	}
 
-	uploadTargets["started.json"] = gcs.DataUpload(bytes.NewReader(startedData))
+	uploadTargets[prowv1.StartedStatusFile] = gcs.DataUpload(bytes.NewReader(startedData))
 
-	if err := o.Options.Run(spec, uploadTargets); err != nil {
-		return fmt.Errorf("failed to upload to GCS: %v", err)
+	ctx := context.Background()
+	if err := o.Options.Run(ctx, spec, uploadTargets); err != nil {
+		return fmt.Errorf("failed to upload to blob storage: %v", err)
 	}
 
 	if failed {
@@ -111,7 +119,7 @@ func (o Options) Run() error {
 	return nil
 }
 
-// processCloneLog checks if clone operation successed or failed for a ref
+// processCloneLog checks if clone operation succeeded or failed for a ref
 // and upload clone logs as build log upon failures.
 // returns: bool - clone status
 //          []Record - containing final SHA on successful clones
@@ -151,7 +159,7 @@ func processCloneLog(logfile string, uploadTargets map[string]gcs.UploadFunc) (b
 		if err != nil {
 			return true, cloneRecords, fmt.Errorf("could not marshal finishing data: %v", err)
 		}
-		uploadTargets["finished.json"] = gcs.DataUpload(bytes.NewReader(finishedData))
+		uploadTargets[prowv1.FinishedStatusFile] = gcs.DataUpload(bytes.NewReader(finishedData))
 	}
 	return failed, cloneRecords, nil
 }

@@ -10,9 +10,13 @@ Build with:
 ```shell
 bazel build //prow/...
 ```
-Test with:
+Unit test with:
 ```shell
-bazel test --features=race //prow/...
+bazel test --@io_bazel_rules_go//go/config:race //prow/...
+```
+Integration test with([more details](./test/integration)):
+```shell
+./prow/test/integration/integration-test.sh
 ```
 Individual packages and components can be built and tested like:
 ```shell
@@ -31,7 +35,7 @@ Assuming your prow components have multiple replicas, this will result in no dow
 
 Update your deployment (optionally build/pushing the image) to a new image with:
 ```shell
-# export PROW_REPO_OVERRIDE=gcr.io/k8s-prow  # optionally override project
+# export PROW_REPO_OVERRIDE=gcr.io/k8s-prow  # optionally change k8s-prow to your project
 push.sh  # Build and push the current repo state.
 bump.sh --list  # Choose a recent published version
 bump.sh v20181002-deadbeef # Use a specific version
@@ -45,15 +49,15 @@ export PROW_CLUSTER_OVERRIDE=my-k8s-cluster-context # or whatever the correct va
 export BUILD_CLUSTER_OVERRIDE=my-k8s-job-cluster-context # or whatever the correct value is
 
 # Generally just do
-bazel run //prow/cluster:production.apply # deploy everything
+bazel run //config/prow/cluster:production.apply # deploy everything
 
 # In case of an emergency hook update
-bazel run //prow/cluster:hook.apply # just update hook
+bazel run //config/prow/cluster:hook.apply # just update hook
 
 # This is equivalent to doing the following with kubectl directly:
 kubectl config use-context my-k8s-cluster-context
-kubectl apply -f prow/cluster/*.yaml
-kubectl apply -f prow/cluster/hook_deployment.yaml
+kubectl apply -f config/prow/cluster/*.yaml
+kubectl apply -f config/prow/cluster/hook_deployment.yaml
 ```
 
 ## How to test a ProwJob
@@ -90,12 +94,12 @@ cluster named `mkpod` is created if one does not already exist.
 be decorated with the pod utilities if needed and will exactly match what would be
 applied in prod with two exceptions:
 	1. The job logs, metadata, and artifacts will be copied to disk rather than
-	uploaded to GCS. By default these files are copied to `/etc/prowjob-out/<job-name>/<build-id>/`
+	uploaded to GCS. By default these files are copied to `/mnt/disks/prowjob-out/<job-name>/<build-id>/`
 	on the host machine.
 	1. Any volume mounts may be substituted for `emptyDir` or `hostPath` volumes at the
 	interactive prompt to replace dependencies that are only available in prod.
-	Note: In order for `hostPath` to reach the host and not just the Kind "node" container,
-	use paths under `/etc/kind-node` or set `$NODE_DIR` before the mkpod cluster is created.
+	__NOTE!__ In order for `hostPath` volume sources to reach the host and not just the Kind "node" container,
+	use paths under `/mnt/disks/kind-node` or set `$NODE_DIR` before the mkpod cluster is created.
 1. Applies the Pod to the [Kind] cluster and starts watching it (interrupt whenever,
 this is for convenience). At this point the Pod will start running if configured
 correctly.
@@ -118,6 +122,10 @@ This command runs the ProwJob [`pull-test-infra-yamllint`](https://github.com/ku
 ```sh
 ./pj-on-kind.sh pull-test-infra-yamllint
 ```
+You may also need to set the `CONFIG_PATH` and `JOB_CONFIG_PATH` environmental variables:
+```sh
+CONFIG_PATH=$(realpath ../config/prow/config.yaml) JOB_CONFIG_PATH=$(realpath ../config/jobs/kubernetes/test-infra/test-infra-presubmits.yaml) ...
+```
 
 ##### Modifying pj-on-kind.sh for special scenarios
 This tool was written in bash so that it can be easily adjusted when debugging.
@@ -127,6 +135,12 @@ secrets, configmaps, or volumes.
 * Skip applying the pod.yaml to the Kind cluster to inspect it, modify it, or apply it to
 a real cluster instead of the `mkpod` Kind cluster. (Same for pj.yaml)
 
+##### Debugging within a pj-on-kind.sh container
+To point `kubectl` to the Kind cluster you will need to export the `KUBECONFIG` Env. The command to point this to the correct config is echoed in the pj-on-kind.sh logging. It will have the form:
+```sh
+export KUBECONFIG='/<path to user dir>/.kube/kind-config-mkpod'
+```
+After pointing to the correct master you will be able to drop into the container using `kubectl exec -it <pod name> <bash/sh/etc>`. **This pod will only last the lifecycle of the job, if you need more time to debug you might add a `sleep` within the job execution.
 
 #### Using Phaino
 [Phaino](/prow/cmd/phaino) lets you interactively mock and run the job locally on

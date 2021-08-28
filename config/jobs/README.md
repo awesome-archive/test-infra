@@ -19,7 +19,7 @@ info, it was sourced from the following:
 
 There are three types of prow jobs:
 
-- **Presubumits** run against code in PRs
+- **Presubmits** run against code in PRs
 - **Postsubmits** run after merging code
 - **Periodics** run on a periodic basis
 
@@ -65,6 +65,15 @@ files here. eg:
   for kops tests in a well known location, with an env var pointint to it
 - [the default preset with no labels] is used to set the `GOPROXY` env var
   for all jobs by default
+
+## Secrets
+
+Prow jobs can use secrets located in the same namespace within the cluster
+where the jobs are executed, by using the [same mechanism of
+podspec](https://kubernetes.io/docs/concepts/configuration/secret/#using-secrets).
+The secrets used in prow jobs can be source controlled and synced from any major
+secret manager provider, such as google secret manager, see
+[prow_secret](./prow/prow_secrets.md) for instructions.
 
 ## Job Examples
 
@@ -130,7 +139,7 @@ periodics:
     path_alias: "sigs.k8s.io/cluster-api-provider-aws"
   spec:
     containers:
-    - image: gcr.io/k8s-testimages/kubekins-e2e:v20190618-b782256-1.15
+    - image: gcr.io/k8s-testimages/kubekins-e2e:v20200428-06f6e3b-1.15
       command:
       - "./scripts/ci-aws-cred-test.sh"
 ```
@@ -171,6 +180,18 @@ recognize this is going to depend on review latency.
 
 For more details, please refer to [How to Test a ProwJob](/prow/build_test_update.md#how-to-test-a-prowjob)
 
+## Running a Production Job
+
+Normally prow will automatically schedule your job, however if for some reason you
+need to trigger it again and are a Prow administrator you have a few options:
+
+- you can use the rerun feature in prow.k8s.io to run the job again *with the same config*
+- you can use [`config/mkpj.sh`](/config/mkpj.sh) to create a prowjob CR from your local config
+- you can use `bazel run //prow/cmd/mkpj -- --job=foo ...` to create a prowjob CR from your local config
+
+For the latter two options you'll need to submit the resulting CR via `kubectl` configured against
+the prow services cluster.
+
 ## Generated Jobs
 
 There are some sets of jobs that are generated and should not be edited by hand.
@@ -180,22 +201,23 @@ than in this central README, but here we are for now.
 ### image-validation jobs
 
 These test different master/node image versions against multiple k8s branches. If you
-want to change these, update [`experiment/test_config.yaml`](/experiment/test_config.yaml)
+want to change these, update [`releng/test_config.yaml`](/releng/test_config.yaml)
 and then run
 
-```
-bazel run //experiment:generate_tests -- --yaml-config-path=experiment/test_config.yaml
+```sh
+# from test-infra root
+$ ./hack/update-generated-tests.sh
 ```
 
 ### release-branch jobs
 
 When a release branch of kubernetes is first cut, the current set of master jobs
-must be forked to use the new release branch. Use [`experiment/config-forker`] to
+must be forked to use the new release branch. Use [`releng/config-forker`] to
 accomplish this, eg:
 
-```
+```sh
 # from test-infra root
-bazel run //experiment/config-forker -- \
+$ bazel run //releng/config-forker -- \
   --job-config $(pwd)/config/jobs \
   --version 1.15 \
   --output $(pwd)/config/jobs/kubernetes/sig-release/release-branch-jobs/1.15.yaml
@@ -206,7 +228,7 @@ bazel run //experiment/config-forker -- \
 [testgrid annotations]: /testgrid/config.md#prow-job-configuration
 [testgrid.k8s.io]: https://testgrid.k8s.io
 
-[`experiment/config-forker`]: /experiment/config-forker
+[`releng/config-forker`]: /releng/config-forker
 [`images/`]: /images
 
 [periodic-kubernetes-e2e-packages-pushed]: https://github.com/kubernetes/test-infra/blob/688d365adf7f71e33a4249c7b90d7e84c105dfc5/config/jobs/kubernetes/sig-cluster-lifecycle/packages.yaml#L3-L16

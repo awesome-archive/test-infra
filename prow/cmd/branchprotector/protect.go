@@ -17,9 +17,9 @@ limitations under the License.
 package main
 
 import (
-	"errors"
 	"flag"
 	"fmt"
+	"net/url"
 	"os"
 	"regexp"
 	"sort"
@@ -28,21 +28,31 @@ import (
 
 	"github.com/sirupsen/logrus"
 
+	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/test-infra/prow/config"
-	"k8s.io/test-infra/prow/config/secret"
-	"k8s.io/test-infra/prow/errorutil"
 	"k8s.io/test-infra/prow/flagutil"
+	configflagutil "k8s.io/test-infra/prow/flagutil/config"
 	"k8s.io/test-infra/prow/github"
 	"k8s.io/test-infra/prow/logrusutil"
 )
 
+const (
+	defaultTokens = 300
+	defaultBurst  = 100
+)
+
 type options struct {
-	config             string
-	jobConfig          string
+	config             configflagutil.ConfigOptions
 	confirm            bool
 	verifyRestrictions bool
-	github             flagutil.GitHubOptions
+
+	// TODO(petr-muller): Remove after August 2021, replaced by github.ThrottleHourlyTokens
+	tokens     int
+	tokenBurst int
+
+	github           flagutil.GitHubOptions
+	githubEnablement flagutil.GitHubEnablementOptions
 }
 
 func (o *options) Validate() error {
@@ -50,8 +60,27 @@ func (o *options) Validate() error {
 		return err
 	}
 
-	if o.config == "" {
-		return errors.New("empty --config-path")
+	if err := o.githubEnablement.Validate(!o.confirm); err != nil {
+		return err
+	}
+
+	if err := o.config.Validate(!o.confirm); err != nil {
+		return err
+	}
+
+	if o.tokens != defaultTokens {
+		if o.github.ThrottleHourlyTokens != defaultTokens {
+			return fmt.Errorf("--tokens cannot be specified together with --github-hourly-tokens: use just the latter")
+		}
+		logrus.Warn("--tokens is deprecated: use --github-hourly-tokens instead")
+		o.github.ThrottleHourlyTokens = o.tokens
+	}
+	if o.tokenBurst != defaultBurst {
+		if o.github.ThrottleAllowBurst != defaultBurst {
+			return fmt.Errorf("--token-burst cannot be specified together with --github-allowed-burst: use just the latter")
+		}
+		logrus.Warn("--token-burst is deprecated: use --github-allowed-burst instead")
+		o.github.ThrottleAllowBurst = o.tokenBurst
 	}
 
 	return nil
@@ -60,11 +89,13 @@ func (o *options) Validate() error {
 func gatherOptions() options {
 	o := options{}
 	fs := flag.NewFlagSet(os.Args[0], flag.ExitOnError)
-	fs.StringVar(&o.config, "config-path", "", "Path to prow config.yaml")
-	fs.StringVar(&o.jobConfig, "job-config-path", "", "Path to prow job configs.")
 	fs.BoolVar(&o.confirm, "confirm", false, "Mutate github if set")
 	fs.BoolVar(&o.verifyRestrictions, "verify-restrictions", false, "Verify the restrictions section of the request for authorized collaborators/teams")
-	o.github.AddFlags(fs)
+	fs.IntVar(&o.tokens, "tokens", defaultTokens, "Throttle hourly token consumption (0 to disable) DEPRECATED: use --github-hourly-tokens")
+	fs.IntVar(&o.tokenBurst, "token-burst", defaultBurst, "Allow consuming a subset of hourly tokens in a short burst. DEPRECATED: use --github-allowed-burst")
+	o.config.AddFlags(fs)
+	o.github.AddCustomizedFlags(fs, flagutil.ThrottlerDefaults(defaultTokens, defaultBurst))
+	o.githubEnablement.AddFlags(fs)
 	fs.Parse(os.Args[1:])
 	return o
 }
@@ -90,28 +121,24 @@ func (e *Errors) add(err error) {
 }
 
 func main() {
-	logrusutil.ComponentInit("branchprotector")
+	logrusutil.ComponentInit()
 
 	o := gatherOptions()
 	if err := o.Validate(); err != nil {
 		logrus.Fatal(err)
 	}
 
-	cfg, err := config.Load(o.config, o.jobConfig)
+	ca, err := o.config.ConfigAgent()
 	if err != nil {
-		logrus.WithError(err).Fatalf("Failed to load --config-path=%s", o.config)
+		logrus.WithError(err).Fatalf("Failed to load --config-path=%s", o.config.ConfigPath)
 	}
+	cfg := ca.Config()
+	cfg.BranchProtectionWarnings(logrus.NewEntry(logrus.StandardLogger()), cfg.PresubmitsStatic)
 
-	secretAgent := &secret.Agent{}
-	if err := secretAgent.Start([]string{o.github.TokenPath}); err != nil {
-		logrus.WithError(err).Fatal("Error starting secrets agent.")
-	}
-
-	githubClient, err := o.github.GitHubClient(secretAgent, !o.confirm)
+	githubClient, err := o.github.GitHubClient(!o.confirm)
 	if err != nil {
 		logrus.WithError(err).Fatal("Error getting GitHub client.")
 	}
-	githubClient.Throttle(300, 100) // 300 hourly tokens, bursts of 100
 
 	p := protector{
 		client:             githubClient,
@@ -121,6 +148,7 @@ func main() {
 		completedRepos:     make(map[string]bool),
 		done:               make(chan []error),
 		verifyRestrictions: o.verifyRestrictions,
+		enabled:            o.githubEnablement.EnablementChecker(),
 	}
 
 	go p.configureBranches()
@@ -140,7 +168,7 @@ type client interface {
 	RemoveBranchProtection(org, repo, branch string) error
 	UpdateBranchProtection(org, repo, branch string, config github.BranchProtectionRequest) error
 	GetBranches(org, repo string, onlyProtected bool) ([]github.Branch, error)
-	GetRepo(owner, name string) (github.Repo, error)
+	GetRepo(owner, name string) (github.FullRepo, error)
 	GetRepos(org string, user bool) ([]github.Repo, error)
 	ListCollaborators(org, repo string) ([]github.User, error)
 	ListRepoTeams(org, repo string) ([]github.Team, error)
@@ -154,6 +182,7 @@ type protector struct {
 	completedRepos     map[string]bool
 	done               chan []error
 	verifyRestrictions bool
+	enabled            func(org, repo string) bool
 }
 
 func (p *protector) configureBranches() {
@@ -175,9 +204,16 @@ func (p *protector) configureBranches() {
 // protect protects branches specified in the presubmit and branch-protection config sections.
 func (p *protector) protect() {
 	bp := p.cfg.BranchProtection
+	if bp.Policy.Unmanaged != nil && *bp.Policy.Unmanaged {
+		logrus.Warn("Branchprotection has global unmanaged: true, will not do anything")
+		return
+	}
 
 	// Scan the branch-protection configuration
 	for orgName := range bp.Orgs {
+		if !p.enabled(orgName, "") {
+			continue
+		}
 		org := bp.GetOrg(orgName)
 		if err := p.UpdateOrg(orgName, *org); err != nil {
 			p.errors.add(fmt.Errorf("update %s: %v", orgName, err))
@@ -185,13 +221,16 @@ func (p *protector) protect() {
 	}
 
 	// Do not automatically protect tested repositories
-	if !bp.ProtectTested {
+	if bp.ProtectTested == nil || !*bp.ProtectTested {
 		return
 	}
 
 	// Some repos with presubmits might not be listed in the branch-protection
-	for repo := range p.cfg.Presubmits {
-		if p.completedRepos[repo] == true {
+	// Using PresubmitsStatic here is safe because this is only about getting to
+	// know which repos exist. Repos that use in-repo config will appear here,
+	// because we generate a verification job for them
+	for repo := range p.cfg.PresubmitsStatic {
+		if p.completedRepos[repo] {
 			continue
 		}
 		parts := strings.Split(repo, "/")
@@ -201,6 +240,9 @@ func (p *protector) protect() {
 		}
 		orgName := parts[0]
 		repoName := parts[1]
+		if !p.enabled(orgName, repoName) {
+			continue
+		}
 		repo := bp.GetOrg(orgName).GetRepo(repoName)
 		if err := p.UpdateRepo(orgName, repoName, *repo); err != nil {
 			p.errors.add(fmt.Errorf("update %s/%s: %v", orgName, repoName, err))
@@ -210,6 +252,10 @@ func (p *protector) protect() {
 
 // UpdateOrg updates all repos in the org with the specified defaults
 func (p *protector) UpdateOrg(orgName string, org config.Org) error {
+	if org.Policy.Unmanaged != nil && *org.Policy.Unmanaged {
+		return nil
+	}
+
 	var repos []string
 	if org.Protect != nil {
 		// Strongly opinionated org, configure every repo in the org.
@@ -218,9 +264,15 @@ func (p *protector) UpdateOrg(orgName string, org config.Org) error {
 			return fmt.Errorf("list repos: %v", err)
 		}
 		for _, r := range rs {
-			if !r.Archived {
-				repos = append(repos, r.Name)
+			// Skip Archived repos as they can't be modified in this way
+			if r.Archived {
+				continue
 			}
+			// Skip private security forks as they can't be modified in this way
+			if r.Private && github.SecurityForkNameRE.MatchString(r.Name) {
+				continue
+			}
+			repos = append(repos, r.Name)
 		}
 	} else {
 		// Unopinionated org, just set explicitly defined repos
@@ -231,26 +283,44 @@ func (p *protector) UpdateOrg(orgName string, org config.Org) error {
 
 	var errs []error
 	for _, repoName := range repos {
+		if !p.enabled(orgName, repoName) {
+			continue
+		}
 		repo := org.GetRepo(repoName)
 		if err := p.UpdateRepo(orgName, repoName, *repo); err != nil {
 			errs = append(errs, fmt.Errorf("update %s: %v", repoName, err))
 		}
 	}
 
-	return errorutil.NewAggregate(errs...)
+	return utilerrors.NewAggregate(errs)
 }
 
 // UpdateRepo updates all branches in the repo with the specified defaults
 func (p *protector) UpdateRepo(orgName string, repoName string, repo config.Repo) error {
 	p.completedRepos[orgName+"/"+repoName] = true
+	if repo.Policy.Unmanaged != nil && *repo.Policy.Unmanaged {
+		return nil
+	}
 
 	githubRepo, err := p.client.GetRepo(orgName, repoName)
 	if err != nil {
 		return fmt.Errorf("could not get repo to check for archival: %v", err)
 	}
+	// Skip Archived repos as they can't be modified in this way
 	if githubRepo.Archived {
-		// nothing to do
 		return nil
+	}
+	// Skip private security forks as they can't be modified in this way
+	if githubRepo.Private && github.SecurityForkNameRE.MatchString(githubRepo.Name) {
+		return nil
+	}
+
+	var branchInclusions *regexp.Regexp
+	if len(repo.Policy.Include) > 0 {
+		branchInclusions, err = regexp.Compile(strings.Join(repo.Policy.Include, `|`))
+		if err != nil {
+			return err
+		}
 	}
 
 	var branchExclusions *regexp.Regexp
@@ -269,7 +339,12 @@ func (p *protector) UpdateRepo(orgName string, repoName string, repo config.Repo
 		}
 		for _, b := range bs {
 			_, ok := repo.Branches[b.Name]
-			if !ok && branchExclusions != nil && branchExclusions.MatchString(b.Name) {
+			if !ok && branchInclusions != nil && branchInclusions.MatchString(b.Name) {
+				branches[b.Name] = b
+			} else if !ok && branchInclusions != nil && !branchInclusions.MatchString(b.Name) {
+				logrus.Infof("%s/%s=%s: not included", orgName, repoName, b.Name)
+				continue
+			} else if !ok && branchExclusions != nil && branchExclusions.MatchString(b.Name) {
 				logrus.Infof("%s/%s=%s: excluded", orgName, repoName, b.Name)
 				continue
 			}
@@ -301,7 +376,7 @@ func (p *protector) UpdateRepo(orgName string, repoName string, repo config.Repo
 		}
 	}
 
-	return errorutil.NewAggregate(errs...)
+	return utilerrors.NewAggregate(errs)
 }
 
 // authorizedCollaborators returns the list of Logins for users that are
@@ -357,7 +432,10 @@ func validateRestrictions(org, repo string, bp *github.BranchProtectionRequest, 
 
 // UpdateBranch updates the branch with the specified configuration
 func (p *protector) UpdateBranch(orgName, repo string, branchName string, branch config.Branch, protected bool, authorizedCollaborators, authorizedTeams []string) error {
-	bp, err := p.cfg.GetPolicy(orgName, repo, branchName, branch)
+	if branch.Unmanaged != nil && *branch.Unmanaged {
+		return nil
+	}
+	bp, err := p.cfg.GetPolicy(orgName, repo, branchName, branch, p.cfg.PresubmitsStatic[orgName+"/"+repo])
 	if err != nil {
 		return fmt.Errorf("get policy: %v", err)
 	}
@@ -386,10 +464,14 @@ func (p *protector) UpdateBranch(orgName, repo string, branchName string, branch
 		}
 	}
 
+	// github API is very sensitive if branchName contains extra characters,
+	// therefor we need to url encode the branch name.
+	branchNameForRequest := url.QueryEscape(branchName)
+
 	// The github API currently does not support listing protections for all
 	// branches of a repository. We therefore have to make individual requests
 	// for each branch.
-	currentBP, err := p.client.GetBranchProtection(orgName, repo, branchName)
+	currentBP, err := p.client.GetBranchProtection(orgName, repo, branchNameForRequest)
 	if err != nil {
 		return fmt.Errorf("get current branch protection: %v", err)
 	}
@@ -466,7 +548,7 @@ func equalAdminEnforcement(state github.EnforceAdmins, request *bool) bool {
 		// bound by the branch protection rules. Therefore, making no
 		// request is equivalent to making a request to not enforce
 		// rules on admins.
-		return state.Enabled == false
+		return !state.Enabled
 	default:
 		return state.Enabled == *request
 	}

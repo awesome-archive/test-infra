@@ -25,9 +25,12 @@ import (
 	"fmt"
 	"html/template"
 	"path/filepath"
+	"strings"
 
 	"github.com/sirupsen/logrus"
 
+	"k8s.io/test-infra/prow/config"
+	"k8s.io/test-infra/prow/spyglass/api"
 	"k8s.io/test-infra/prow/spyglass/lenses"
 )
 
@@ -54,7 +57,7 @@ func (lens Lens) Config() lenses.LensConfig {
 }
 
 // Header renders the content of <head> from template.html.
-func (lens Lens) Header(artifacts []lenses.Artifact, resourceDir string, config json.RawMessage) string {
+func (lens Lens) Header(artifacts []api.Artifact, resourceDir string, config json.RawMessage, spyglassConfig config.Spyglass) string {
 	t, err := template.ParseFiles(filepath.Join(resourceDir, "template.html"))
 	if err != nil {
 		return fmt.Sprintf("<!-- FAILED LOADING HEADER: %v -->", err)
@@ -67,18 +70,35 @@ func (lens Lens) Header(artifacts []lenses.Artifact, resourceDir string, config 
 }
 
 // Callback does nothing.
-func (lens Lens) Callback(artifacts []lenses.Artifact, resourceDir string, data string, config json.RawMessage) string {
+func (lens Lens) Callback(artifacts []api.Artifact, resourceDir string, data string, config json.RawMessage, spyglassConfig config.Spyglass) string {
 	return ""
 }
 
 // Body renders the <body>
-func (lens Lens) Body(artifacts []lenses.Artifact, resourceDir string, data string, config json.RawMessage) string {
+func (lens Lens) Body(artifacts []api.Artifact, resourceDir string, data string, config json.RawMessage, spyglassConfig config.Spyglass) string {
 	if len(artifacts) == 0 {
 		logrus.Error("coverage Body() called with no artifacts, which should never happen.")
 		return "Why am I here? There is no coverage file."
 	}
 
-	content, err := artifacts[0].ReadAll()
+	profileArtifact := artifacts[0]
+	var htmlArtifact api.Artifact
+	if len(artifacts) > 1 {
+		if len(artifacts) > 2 {
+			return "Too many files - expected one coverage file and one optional HTML file"
+		}
+		if strings.HasSuffix(artifacts[0].JobPath(), ".html") {
+			htmlArtifact = artifacts[0]
+			profileArtifact = artifacts[1]
+		} else if strings.HasSuffix(artifacts[1].JobPath(), ".html") {
+			htmlArtifact = artifacts[1]
+			profileArtifact = artifacts[0]
+		} else {
+			return "Multiple input files, but none had a .html extension."
+		}
+	}
+
+	content, err := profileArtifact.ReadAll()
 	if err != nil {
 		logrus.WithError(err).Warn("Couldn't read a coverage file that should exist.")
 		return fmt.Sprintf("Faiiled to read the coverage file: %v", err)
@@ -103,10 +123,16 @@ func (lens Lens) Body(artifacts []lenses.Artifact, resourceDir string, data stri
 	}
 	result := base64.StdEncoding.EncodeToString(w.Bytes())
 
+	renderedCoverageURL := ""
+	if htmlArtifact != nil {
+		renderedCoverageURL = htmlArtifact.CanonicalLink()
+	}
 	t := struct {
-		CoverageContent string
+		CoverageContent  string
+		RenderedCoverage string
 	}{
-		CoverageContent: result,
+		CoverageContent:  result,
+		RenderedCoverage: renderedCoverageURL,
 	}
 	var buf bytes.Buffer
 	if err := coverageTemplate.ExecuteTemplate(&buf, "body", t); err != nil {

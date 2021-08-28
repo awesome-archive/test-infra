@@ -64,7 +64,7 @@ var diskCheckInterval = flag.Duration("disk-check-interval", time.Second*10,
 var promMetrics *prometheusMetrics
 
 func init() {
-	logrusutil.ComponentInit("greenhouse")
+	logrusutil.ComponentInit()
 
 	logrus.SetOutput(os.Stdout)
 	promMetrics = initMetrics()
@@ -195,7 +195,7 @@ func updateMetrics(interval time.Duration, diskRoot string) {
 	ticker := time.NewTicker(interval)
 	for ; true; <-ticker.C {
 		logger.Info("tick")
-		_, bytesFree, bytesUsed, err := diskutil.GetDiskUsage(diskRoot)
+		_, bytesFree, bytesUsed, _, _, _, err := diskutil.GetDiskUsage(diskRoot)
 		if err != nil {
 			logger.WithError(err).Error("Failed to get disk metrics")
 		} else {

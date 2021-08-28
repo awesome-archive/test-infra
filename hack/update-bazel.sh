@@ -17,36 +17,43 @@ set -o errexit
 set -o nounset
 set -o pipefail
 
-if [[ -n "${BUILD_WORKSPACE_DIRECTORY:-}" ]]; then # Running inside bazel
-  echo "Updating bazel rules..." >&2
-elif ! command -v bazel &>/dev/null; then
-  echo "Install bazel at https://bazel.build" >&2
-  exit 1
-elif ! bazel query @com_github_bazelbuild_bazel_gazelle//cmd/gazelle &>/dev/null; then
-  (
-    set -o xtrace
-    bazel run @io_k8s_test_infra//hack:bootstrap-testinfra
-    bazel run @io_k8s_test_infra//hack:update-bazel
-  )
-  exit 0
+
+bazel-from-image() {
+	if [ -x "$(command -v docker)" ]; then
+	    CONTAINER_ENGINE=docker
+	elif [ -x "$(command -v podman)" ]; then
+	    CONTAINER_ENGINE=podman
+	else
+		echo "There is no docker or podman installed. Please use hack/update-bazel.sh script instead."
+		exit 1
+	fi
+
+	WORKDIR=$(pwd)
+	TEST_INFRA_PATH=${WORKDIR%/hack}
+
+
+	$CONTAINER_ENGINE run --user $(id -u):$(id -g) --volume ${TEST_INFRA_PATH}:/test-infra:Z \
+	--workdir /test-infra --rm gcr.io/k8s-testimages/launcher.gcr.io/google/bazel:latest-test-infra $@
+}
+
+bazel-direct() {
+  bazel $@
+}
+
+bazel-from-bazelisk() {
+  bazelisk $@
+}
+
+if [[ "${1:-}" == "--from-image" ]]; then
+	bazel=bazel-from-image
+elif [ -x "$(command -v bazelisk)" ]; then
+  bazel=bazel-from-bazelisk
+elif [ -x "$(command -v bazel)" ]; then
+  bazel=bazel-direct
 else
-  (
-    set -o xtrace
-    bazel run @io_k8s_test_infra//hack:update-bazel
-  )
-  exit 0
+  bazel=bazel-from-image
 fi
 
-gazelle=$(realpath "$1")
-kazel=$(realpath "$2")
+"$bazel" run @io_k8s_repo_infra//hack:update-bazel
 
-cd "$BUILD_WORKSPACE_DIRECTORY"
-
-if [[ ! -f go.mod ]]; then
-    echo "No module defined, see https://github.com/golang/go/wiki/Modules#how-to-define-a-module" >&2
-    exit 1
-fi
-
-set -o xtrace
-"$gazelle" fix --external=external
-"$kazel" --cfg-path=./hack/.kazelcfg.json
+exit $?

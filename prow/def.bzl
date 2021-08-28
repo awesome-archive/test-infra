@@ -21,14 +21,21 @@ load("@io_bazel_rules_k8s//k8s:objects.bzl", "k8s_objects")
 load(
     "//def:image.bzl",
     _image_tags = "tags",
+    _image_tags_arm64 = "tags_arm64",
+    _image_tags_ppc64le = "tags_ppc64le",
 )
 
-## prow_image is a macro for creating :app and :image targets
+# prow_image is a macro for creating :app and :image targets
 def prow_image(
+        component,
         name,  # use "image"
         base = None,
+        base_arm64 = None,
+        base_ppc64le = None,
         stamp = True,  # stamp by default, but allow overrides
         app_name = "app",
+        build_arm64 = False,
+        build_ppc64le = False,
         **kwargs):
     go_image(
         name = app_name,
@@ -37,6 +44,7 @@ def prow_image(
         goarch = "amd64",
         goos = "linux",
         pure = "on",
+        x_defs = {"k8s.io/test-infra/prow/version.Name": component},
     )
 
     container_image(
@@ -45,6 +53,44 @@ def prow_image(
         stamp = stamp,
         **kwargs
     )
+
+    if build_arm64 == True:
+        go_image(
+            name = "%s-arm64" % app_name,
+            base = base_arm64,
+            embed = [":go_default_library"],
+            goarch = "arm64",
+            goos = "linux",
+            pure = "on",
+            x_defs = {"k8s.io/test-infra/prow/version.Name": component},
+        )
+
+        container_image(
+            name = "%s-arm64" % name,
+            base = ":%s-arm64" % app_name,
+            architecture = "arm64",
+            stamp = stamp,
+            **kwargs
+        )
+
+    if build_ppc64le == True:
+        go_image(
+            name = "%s-ppc64le" % app_name,
+            base = base_ppc64le,
+            embed = [":go_default_library"],
+            goarch = "ppc64le",
+            goos = "linux",
+            pure = "on",
+            x_defs = {"k8s.io/test-infra/prow/version.Name": component},
+        )
+
+        container_image(
+            name = "%s-ppc64le" % name,
+            base = ":%s-ppc64le" % app_name,
+            architecture = "ppc64le",
+            stamp = stamp,
+            **kwargs
+        )
 
 # prow_push creates a bundle of container images, and a target to push them.
 def prow_push(
@@ -64,8 +110,9 @@ def prow_push(
 MULTI_KIND = None
 CORE_CLUSTER = "{STABLE_PROW_CLUSTER}"  # For components like hook
 BUILD_CLUSTER = "{STABLE_BUILD_CLUSTER}"  # For untrusted test code
+EDGE_PROW_REPO = "{EDGE_PROW_REPO}"  # Container registry for edge images.
 
-# image returns the image prefix for the command.
+# prefix returns the image prefix for the command.
 #
 # Concretely, image("foo") returns "{STABLE_PROW_REPO}/foo"
 # which usually becomes gcr.io/k8s-prow/foo
@@ -73,15 +120,35 @@ BUILD_CLUSTER = "{STABLE_BUILD_CLUSTER}"  # For untrusted test code
 def prefix(cmd):
     return "{STABLE_PROW_REPO}/%s" % cmd
 
+# edge_prefix returns the edge image prefix for the command.
+#
+# Concretely, image("foo") returns "{EDGE_PROW_REPO}/foo"
+# which usually becomes gcr.io/k8s-prow-edge/foo
+# (See hack/print-workspace-status.sh)
+def edge_prefix(cmd):
+    return "%s/%s" % (EDGE_PROW_REPO, cmd)
+
 # target returns the image target for the command.
 #
 # Concretely, target("foo") returns "//prow/cmd/foo:image"
 def target(cmd):
     return "//prow/cmd/%s:image" % cmd
 
+# target_arm64 returns the arm64 image target for the command.
+#
+# Concretely, target("foo") returns "//prow/cmd/foo:image-arm64"
+def target_arm64(cmd):
+    return "//prow/cmd/%s:image-arm64" % cmd
+
+# target_ppc64le returns the arm64 image target for the command.
+#
+# Concretely, target("foo") returns "//prow/cmd/foo:image-ppc64le"
+def target_ppc64le(cmd):
+    return "//prow/cmd/%s:image-ppc64le" % cmd
+
 # tags returns a {image: target} map for each cmd or {name: target} kwarg.
 #
-# In particular it will prefix the cmd image name with {STABLE_PROW_REPO}
+# In particular it will prefix the cmd image name with {STABLE_PROW_REPO} and {EDGE_PROW_REPO}
 # Each image gets three tags: {DOCKER_TAG}, latest, latest-{BUILD_USER}
 #
 # Concretely, tags("hook", "plank", **{"ghproxy": "//ghproxy:image"}) will output the following:
@@ -89,18 +156,38 @@ def target(cmd):
 #     "gcr.io/k8s-prow/hook:20180203-deadbeef": "//prow/cmd/hook:image",
 #     "gcr.io/k8s-prow/hook:latest": "//prow/cmd/hook:image",
 #     "gcr.io/k8s-prow/hook:latest-fejta": "//prow/cmd/hook:image",
-#     "gcr.io/k8s-prow/plank:20180203-deadbeef": "//prow/cmd/plank:image",
-#     "gcr.io/k8s-prow/plank:latest": "//prow/cmd/plank:image",
-#     "gcr.io/k8s-prow/plank:latest-fejta": "//prow/cmd/plank:image",
 #     "gcr.io/k8s-prow/ghproxy:20180203-deadbeef": "//ghproxy:image",
 #     "gcr.io/k8s-prow/ghproxy:latest": "//ghproxy:image",
 #     "gcr.io/k8s-prow/ghproxy:latest-fejta": "//ghproxy:image",
+#     "gcr.io/k8s-prow-edge/hook:20180203-deadbeef": "//prow/cmd/hook:image",
+#     "gcr.io/k8s-prow-edge/hook:latest": "//prow/cmd/hook:image",
+#     "gcr.io/k8s-prow-edge/hook:latest-fejta": "//prow/cmd/hook:image",
+#     "gcr.io/k8s-prow-edge/ghproxy:20180203-deadbeef": "//ghproxy:image",
+#     "gcr.io/k8s-prow-edge/ghproxy:latest": "//ghproxy:image",
+#     "gcr.io/k8s-prow-edge/ghproxy:latest-fejta": "//ghproxy:image",
 #   }
 def tags(cmds, targets):
     # Create :YYYYmmdd-commitish :latest :latest-USER tags
     cmd_targets = {prefix(cmd): target(cmd) for cmd in cmds}
     cmd_targets.update({prefix(p): t for (p, t) in targets.items()})
+    if EDGE_PROW_REPO:
+        cmd_targets.update({edge_prefix(cmd): target(cmd) for cmd in cmds})
+        cmd_targets.update({edge_prefix(p): t for (p, t) in targets.items()})
     return _image_tags(cmd_targets)
+
+# tags_arm64 returns a {image: target-arm64} map for each cmd kwarg.
+def tags_arm64(cmds):
+    cmd_targets = {prefix(cmd): target_arm64(cmd) for cmd in cmds}
+    if EDGE_PROW_REPO:
+        cmd_targets.update({edge_prefix(cmd): target_arm64(cmd) for cmd in cmds})
+    return _image_tags_arm64(cmd_targets)
+
+# tags_ppc64le returns a {image: target-ppc64le} map for each cmd kwarg.
+def tags_ppc64le(cmds):
+    cmd_targets = {prefix(cmd): target_ppc64le(cmd) for cmd in cmds}
+    if EDGE_PROW_REPO:
+        cmd_targets.update({edge_prefix(cmd): target_ppc64le(cmd) for cmd in cmds})
+    return _image_tags_ppc64le(cmd_targets)
 
 def object(name, cluster = CORE_CLUSTER, **kwargs):
     k8s_object(
@@ -153,8 +240,8 @@ def component(cmd, *kinds, **kwargs):
 # target which includes everything.
 #
 # Thus you can do things like:
-#   bazel run //prow/cluster:hook.apply  # Update all hook resources
-#   bazel run //prow/cluster:staging.apply  # Update everything on staging prow
+#   bazel run //config/prow/cluster:hook.apply  # Update all hook resources
+#   bazel run //config/prow/cluster:staging.apply  # Update everything on staging prow
 #
 # Concretely, the following:
 #   release(
@@ -186,3 +273,9 @@ def release(name, *components):
         name = name,
         objects = objs,
     )
+
+def dict_union(x, y):
+    z = {}
+    z.update(x)
+    z.update(y)
+    return z

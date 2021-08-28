@@ -19,6 +19,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -33,34 +34,55 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
 	"github.com/gorilla/sessions"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/oauth2"
-	"k8s.io/test-infra/prow/github/fakegithub"
-	"k8s.io/test-infra/prow/githuboauth"
-	"k8s.io/test-infra/prow/plugins"
-
-	"github.com/google/go-github/github"
-
+	coreapi "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/diff"
 	"k8s.io/apimachinery/pkg/util/sets"
-	clienttesting "k8s.io/client-go/testing"
+	ctrlruntimeclient "sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/yaml"
+
 	prowapi "k8s.io/test-infra/prow/apis/prowjobs/v1"
 	"k8s.io/test-infra/prow/client/clientset/versioned/fake"
 	"k8s.io/test-infra/prow/config"
+	"k8s.io/test-infra/prow/deck/jobs"
 	"k8s.io/test-infra/prow/flagutil"
+	configflagutil "k8s.io/test-infra/prow/flagutil/config"
+	pluginsflagutil "k8s.io/test-infra/prow/flagutil/plugins"
+	"k8s.io/test-infra/prow/github/fakegithub"
+	"k8s.io/test-infra/prow/githuboauth"
 	"k8s.io/test-infra/prow/pluginhelp"
+	"k8s.io/test-infra/prow/plugins"
 	_ "k8s.io/test-infra/prow/spyglass/lenses/buildlog"
+	"k8s.io/test-infra/prow/spyglass/lenses/common"
 	_ "k8s.io/test-infra/prow/spyglass/lenses/junit"
 	_ "k8s.io/test-infra/prow/spyglass/lenses/metadata"
 	"k8s.io/test-infra/prow/tide"
 	"k8s.io/test-infra/prow/tide/history"
-	"sigs.k8s.io/yaml"
 )
 
+type fkc []prowapi.ProwJob
+
+func (f fkc) List(ctx context.Context, pjs *prowapi.ProwJobList, _ ...ctrlruntimeclient.ListOption) error {
+	pjs.Items = f
+	return nil
+}
+
+type fca struct {
+	c config.Config
+}
+
+func (ca fca) Config() *config.Config {
+	return &ca.c
+}
+
 func TestOptions_Validate(t *testing.T) {
+	setTenantIDs := flagutil.Strings{}
+	setTenantIDs.Set("Test")
 	var testCases = []struct {
 		name        string
 		input       options
@@ -69,7 +91,7 @@ func TestOptions_Validate(t *testing.T) {
 		{
 			name: "minimal set ok",
 			input: options{
-				configPath: "test",
+				config: configflagutil.ConfigOptions{ConfigPath: "test"},
 			},
 			expectedErr: false,
 		},
@@ -81,7 +103,7 @@ func TestOptions_Validate(t *testing.T) {
 		{
 			name: "ok with oauth",
 			input: options{
-				configPath:            "test",
+				config:                configflagutil.ConfigOptions{ConfigPath: "test"},
 				oauthURL:              "website",
 				githubOAuthConfigFile: "something",
 				cookieSecretFile:      "yum",
@@ -91,7 +113,7 @@ func TestOptions_Validate(t *testing.T) {
 		{
 			name: "missing github config with oauth",
 			input: options{
-				configPath:       "test",
+				config:           configflagutil.ConfigOptions{ConfigPath: "test"},
 				oauthURL:         "website",
 				cookieSecretFile: "yum",
 			},
@@ -100,9 +122,38 @@ func TestOptions_Validate(t *testing.T) {
 		{
 			name: "missing cookie with oauth",
 			input: options{
-				configPath:            "test",
+				config:                configflagutil.ConfigOptions{ConfigPath: "test"},
 				oauthURL:              "website",
 				githubOAuthConfigFile: "something",
+			},
+			expectedErr: true,
+		},
+		{
+			name: "hidden only and show hidden are mutually exclusive",
+			input: options{
+				config:     configflagutil.ConfigOptions{ConfigPath: "test"},
+				hiddenOnly: true,
+				showHidden: true,
+			},
+			expectedErr: true,
+		},
+		{
+			name: "show hidden and tenantIds are mutually exclusive",
+			input: options{
+				config:     configflagutil.ConfigOptions{ConfigPath: "test"},
+				hiddenOnly: false,
+				showHidden: true,
+				tenantIDs:  setTenantIDs,
+			},
+			expectedErr: true,
+		},
+		{
+			name: "hiddenOnly and tenantIds are mutually exclusive",
+			input: options{
+				config:     configflagutil.ConfigOptions{ConfigPath: "test"},
+				hiddenOnly: true,
+				showHidden: false,
+				tenantIDs:  setTenantIDs,
 			},
 			expectedErr: true,
 		},
@@ -121,7 +172,7 @@ func TestOptions_Validate(t *testing.T) {
 
 type flc int
 
-func (f flc) GetJobLog(job, id string) ([]byte, error) {
+func (f flc) GetJobLog(job, id, container string) ([]byte, error) {
 	if job == "job" && id == "123" {
 		return []byte("hello"), nil
 	}
@@ -211,6 +262,102 @@ func TestHandleLog(t *testing.T) {
 	}
 }
 
+// TestHandleProwJobs just checks that the results can be unmarshaled properly, have the same
+func TestHandleProwJobs(t *testing.T) {
+	kc := fkc{
+		prowapi.ProwJob{
+			ObjectMeta: metav1.ObjectMeta{
+				Annotations: map[string]string{
+					"hello": "world",
+				},
+				Labels: map[string]string{
+					"goodbye": "world",
+				},
+			},
+			Spec: prowapi.ProwJobSpec{
+				Agent:            prowapi.KubernetesAgent,
+				Job:              "job",
+				DecorationConfig: &prowapi.DecorationConfig{},
+				PodSpec: &coreapi.PodSpec{
+					Containers: []coreapi.Container{
+						{
+							Name:  "test-1",
+							Image: "tester1",
+						},
+						{
+							Name:  "test-2",
+							Image: "tester2",
+						},
+					},
+				},
+			},
+		},
+		prowapi.ProwJob{
+			ObjectMeta: metav1.ObjectMeta{
+				Annotations: map[string]string{
+					"hello": "world",
+				},
+				Labels: map[string]string{
+					"goodbye": "world",
+				},
+			},
+			Spec: prowapi.ProwJobSpec{
+				Agent:            prowapi.KubernetesAgent,
+				Job:              "missing-podspec-job",
+				DecorationConfig: &prowapi.DecorationConfig{},
+			},
+		},
+	}
+
+	fakeJa := jobs.NewJobAgent(context.Background(), kc, false, true, []string{}, map[string]jobs.PodLogClient{}, fca{}.Config)
+	fakeJa.Start()
+
+	handler := handleProwJobs(fakeJa, logrus.WithField("handler", "/prowjobs.js"))
+	req, err := http.NewRequest(http.MethodGet, "/prowjobs.js?omit=annotations,labels,decoration_config,pod_spec", nil)
+	if err != nil {
+		t.Fatalf("Error making request: %v", err)
+	}
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("Bad error code: %d", rr.Code)
+	}
+	resp := rr.Result()
+	defer resp.Body.Close()
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("Error reading response body: %v", err)
+	}
+	type prowjobItems struct {
+		Items []prowapi.ProwJob `json:"items"`
+	}
+	var res prowjobItems
+	if err := json.Unmarshal(body, &res); err != nil {
+		t.Fatalf("Error unmarshaling: %v", err)
+	}
+	if res.Items[0].Annotations != nil {
+		t.Errorf("Failed to omit annotations correctly, expected: nil, got %v", res.Items[0].Annotations)
+	}
+	if res.Items[0].Labels != nil {
+		t.Errorf("Failed to omit labels correctly, expected: nil, got %v", res.Items[0].Labels)
+	}
+	if res.Items[0].Spec.DecorationConfig != nil {
+		t.Errorf("Failed to omit decoration config correctly, expected: nil, got %v", res.Items[0].Spec.DecorationConfig)
+	}
+
+	// this tests the behavior for filling a podspec with empty containers when asked to omit it
+	emptyPodspec := &coreapi.PodSpec{
+		Containers: []coreapi.Container{{}, {}},
+	}
+	if !equality.Semantic.DeepEqual(res.Items[0].Spec.PodSpec, emptyPodspec) {
+		t.Errorf("Failed to omit podspec correctly\n%s", diff.ObjectReflectDiff(res.Items[0].Spec.PodSpec, emptyPodspec))
+	}
+
+	if res.Items[1].Spec.PodSpec != nil {
+		t.Errorf("Failed to omit podspec correctly, expected: nil, got %v", res.Items[0].Spec.PodSpec)
+	}
+}
+
 // TestProwJob just checks that the result can be unmarshaled properly, has
 // the same status, and has equal spec.
 func TestProwJob(t *testing.T) {
@@ -262,16 +409,12 @@ func TestProwJob(t *testing.T) {
 	}
 }
 
-type mockGitHubConfigGetter struct {
-	githubLogin string
+type fakeAuthenticatedUserIdentifier struct {
+	login string
 }
 
-func (getter mockGitHubConfigGetter) GetGitHubClient(accessToken string, dryRun bool) githuboauth.GitHubClientWrapper {
-	return getter
-}
-
-func (getter mockGitHubConfigGetter) GetUser(login string) (*github.User, error) {
-	return &github.User{Login: &getter.githubLogin}, nil
+func (a *fakeAuthenticatedUserIdentifier) LoginForRequester(requester, token string) (string, error) {
+	return a.login, nil
 }
 
 // TestRerun just checks that the result can be unmarshaled properly, has an
@@ -389,7 +532,7 @@ func TestRerun(t *testing.T) {
 							},
 						},
 					},
-					RerunAuthConfig: prowapi.RerunAuthConfig{
+					RerunAuthConfig: &prowapi.RerunAuthConfig{
 						AllowAnyone:   false,
 						GitHubUsers:   []string{"authorized", "alsoauthorized"},
 						GitHubTeamIDs: []int{42},
@@ -399,7 +542,7 @@ func TestRerun(t *testing.T) {
 					State: prowapi.PendingState,
 				},
 			})
-			configGetter := func() *prowapi.RerunAuthConfig {
+			authCfgGetter := func(refs *prowapi.Refs) *prowapi.RerunAuthConfig {
 				return &prowapi.RerunAuthConfig{
 					AllowAnyone: tc.allowAnyone,
 					GitHubUsers: tc.authorized,
@@ -407,6 +550,9 @@ func TestRerun(t *testing.T) {
 			}
 
 			req, err := http.NewRequest(tc.httpMethod, "/rerun?prowjob=wowsuch", nil)
+			if err != nil {
+				t.Fatalf("Error making request: %v", err)
+			}
 			req.AddCookie(&http.Cookie{
 				Name:    "github_login",
 				Value:   tc.login,
@@ -421,25 +567,23 @@ func TestRerun(t *testing.T) {
 			}
 			session.Values["access-token"] = &oauth2.Token{AccessToken: "validtoken"}
 
-			if err != nil {
-				t.Fatalf("Error making request: %v", err)
-			}
 			rr := httptest.NewRecorder()
-			mockConfig := &config.GitHubOAuthConfig{
+			mockConfig := &githuboauth.Config{
 				CookieStore: mockCookieStore,
 			}
 			goa := githuboauth.NewAgent(mockConfig, &logrus.Entry{})
-			ghc := mockGitHubConfigGetter{githubLogin: tc.login}
-			rc := &fakegithub.FakeClient{OrgMembers: map[string][]string{"org": {"org-member"}}}
+			ghc := &fakeAuthenticatedUserIdentifier{login: tc.login}
+			rc := fakegithub.NewFakeClient()
+			rc.OrgMembers = map[string][]string{"org": {"org-member"}}
 			pca := plugins.NewFakeConfigAgent()
-			handler := handleRerun(fakeProwJobClient.ProwV1().ProwJobs("prowjobs"), tc.rerunCreatesJob, configGetter, goa, ghc, rc, &pca, logrus.WithField("handler", "/rerun"))
+			handler := handleRerun(fakeProwJobClient.ProwV1().ProwJobs("prowjobs"), tc.rerunCreatesJob, authCfgGetter, goa, ghc, rc, &pca, logrus.WithField("handler", "/rerun"))
 			handler.ServeHTTP(rr, req)
 			if rr.Code != tc.httpCode {
 				t.Fatalf("Bad error code: %d", rr.Code)
 			}
 
 			if tc.shouldCreateProwJob {
-				pjs, err := fakeProwJobClient.ProwV1().ProwJobs("prowjobs").List(metav1.ListOptions{})
+				pjs, err := fakeProwJobClient.ProwV1().ProwJobs("prowjobs").List(context.Background(), metav1.ListOptions{})
 				if err != nil {
 					t.Fatalf("failed to list prowjobs: %v", err)
 				}
@@ -480,7 +624,7 @@ func TestTide(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Marshaling: %v", err)
 		}
-		fmt.Fprintf(w, string(b))
+		fmt.Fprint(w, string(b))
 	}))
 	ca := &config.Agent{}
 	ca.Set(&config.Config{
@@ -493,8 +637,12 @@ func TestTide(t *testing.T) {
 		},
 	})
 	ta := tideAgent{
-		path:         s.URL,
+		path: s.URL,
+		hiddenRepos: func() []string {
+			return []string{}
+		},
 		updatePeriod: func() time.Duration { return time.Minute },
+		cfg:          func() *config.Config { return &config.Config{} },
 	}
 	if err := ta.updatePools(); err != nil {
 		t.Fatalf("Updating: %v", err)
@@ -534,7 +682,7 @@ func TestTide(t *testing.T) {
 	if len(res.Queries) != 1 {
 		t.Fatalf("Wrong number of pools. Got %d, expected 1 in %v", len(res.Queries), res.Queries)
 	}
-	if expected := "is:pr state:open repo:\"prowapi.netes/test-infra\""; res.Queries[0] != expected {
+	if expected := "is:pr state:open archived:false repo:\"prowapi.netes/test-infra\""; res.Queries[0] != expected {
 		t.Errorf("Wrong query. Got %s, expected %s", res.Queries[0], expected)
 	}
 }
@@ -550,12 +698,16 @@ func TestTideHistory(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Marshaling: %v", err)
 		}
-		fmt.Fprintf(w, string(b))
+		fmt.Fprint(w, string(b))
 	}))
 
 	ta := tideAgent{
-		path:         s.URL,
+		path: s.URL,
+		hiddenRepos: func() []string {
+			return []string{}
+		},
 		updatePeriod: func() time.Duration { return time.Minute },
+		cfg:          func() *config.Config { return &config.Config{} },
 	}
 	if err := ta.updateHistory(); err != nil {
 		t.Fatalf("Updating: %v", err)
@@ -604,7 +756,7 @@ func TestHelp(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Marshaling: %v", err)
 		}
-		fmt.Fprintf(w, string(b))
+		fmt.Fprint(w, string(b))
 	}))
 	ha := &helpAgent{
 		path: s.URL,
@@ -641,249 +793,6 @@ func TestHelp(t *testing.T) {
 	handleAndCheck()
 }
 
-func TestListProwJobs(t *testing.T) {
-	templateJob := &prowapi.ProwJob{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace: "prowjobs",
-		},
-	}
-
-	var testCases = []struct {
-		name        string
-		selector    string
-		prowJobs    []func(*prowapi.ProwJob) runtime.Object
-		listErr     bool
-		hiddenRepos sets.String
-		hiddenOnly  bool
-		showHidden  bool
-		expected    sets.String
-		expectedErr bool
-	}{
-		{
-			name:        "list error results in filter error",
-			listErr:     true,
-			expectedErr: true,
-		},
-		{
-			name:     "no hidden repos returns all prowjobs",
-			selector: labels.Everything().String(),
-			prowJobs: []func(*prowapi.ProwJob) runtime.Object{
-				func(in *prowapi.ProwJob) runtime.Object {
-					in.Name = "first"
-					return in
-				},
-			},
-			expected: sets.NewString("first"),
-		},
-		{
-			name:     "no hidden repos returns all prowjobs except those not matching label selector",
-			selector: "foo=bar",
-			prowJobs: []func(*prowapi.ProwJob) runtime.Object{
-				func(in *prowapi.ProwJob) runtime.Object {
-					in.Name = "first"
-					return in
-				},
-				func(in *prowapi.ProwJob) runtime.Object {
-					in.Name = "second"
-					in.Labels = map[string]string{"foo": "bar"}
-					return in
-				},
-			},
-			expected: sets.NewString("second"),
-		},
-		{
-			name:     "hidden repos excludes prowjobs from those repos",
-			selector: labels.Everything().String(),
-			prowJobs: []func(*prowapi.ProwJob) runtime.Object{
-				func(in *prowapi.ProwJob) runtime.Object {
-					in.Name = "first"
-					return in
-				},
-				func(in *prowapi.ProwJob) runtime.Object {
-					in.Name = "second"
-					in.Spec.Refs = &prowapi.Refs{
-						Org:  "org",
-						Repo: "repo",
-					}
-					return in
-				},
-			},
-			hiddenRepos: sets.NewString("org/repo"),
-			expected:    sets.NewString("first"),
-		},
-		{
-			name:     "hidden repos doesn't exclude prowjobs from other repos",
-			selector: labels.Everything().String(),
-			prowJobs: []func(*prowapi.ProwJob) runtime.Object{
-				func(in *prowapi.ProwJob) runtime.Object {
-					in.Name = "first"
-					return in
-				},
-				func(in *prowapi.ProwJob) runtime.Object {
-					in.Name = "second"
-					in.Spec.Refs = &prowapi.Refs{
-						Org:  "org",
-						Repo: "other",
-					}
-					return in
-				},
-			},
-			hiddenRepos: sets.NewString("org/repo"),
-			expected:    sets.NewString("first", "second"),
-		},
-		{
-			name:     "hidden orgs excludes prowjobs from those orgs",
-			selector: labels.Everything().String(),
-			prowJobs: []func(*prowapi.ProwJob) runtime.Object{
-				func(in *prowapi.ProwJob) runtime.Object {
-					in.Name = "first"
-					return in
-				},
-				func(in *prowapi.ProwJob) runtime.Object {
-					in.Name = "second"
-					in.Spec.Refs = &prowapi.Refs{
-						Org:  "org",
-						Repo: "other",
-					}
-					return in
-				},
-			},
-			hiddenRepos: sets.NewString("org"),
-			expected:    sets.NewString("first"),
-		},
-		{
-			name:     "hidden orgs doesn't exclude prowjobs from other orgs",
-			selector: labels.Everything().String(),
-			prowJobs: []func(*prowapi.ProwJob) runtime.Object{
-				func(in *prowapi.ProwJob) runtime.Object {
-					in.Name = "first"
-					return in
-				},
-				func(in *prowapi.ProwJob) runtime.Object {
-					in.Name = "second"
-					in.Spec.Refs = &prowapi.Refs{
-						Org:  "other",
-						Repo: "other",
-					}
-					return in
-				},
-			},
-			hiddenRepos: sets.NewString("org"),
-			expected:    sets.NewString("first", "second"),
-		},
-		{
-			name:     "hidden repos excludes prowjobs from those repos even by extra_refs",
-			selector: labels.Everything().String(),
-			prowJobs: []func(*prowapi.ProwJob) runtime.Object{
-				func(in *prowapi.ProwJob) runtime.Object {
-					in.Name = "first"
-					in.Spec.ExtraRefs = []prowapi.Refs{{Org: "org", Repo: "repo"}}
-					return in
-				},
-			},
-			hiddenRepos: sets.NewString("org/repo"),
-			expected:    sets.NewString(),
-		},
-		{
-			name:     "hidden orgs excludes prowjobs from those orgs even by extra_refs",
-			selector: labels.Everything().String(),
-			prowJobs: []func(*prowapi.ProwJob) runtime.Object{
-				func(in *prowapi.ProwJob) runtime.Object {
-					in.Name = "first"
-					in.Spec.ExtraRefs = []prowapi.Refs{{Org: "org", Repo: "repo"}}
-					return in
-				},
-			},
-			hiddenRepos: sets.NewString("org"),
-			expected:    sets.NewString(),
-		},
-		{
-			name:     "prowjobs without refs are returned even with hidden repos filtering",
-			selector: labels.Everything().String(),
-			prowJobs: []func(*prowapi.ProwJob) runtime.Object{
-				func(in *prowapi.ProwJob) runtime.Object {
-					in.Name = "first"
-					return in
-				},
-			},
-			hiddenRepos: sets.NewString("org/repo"),
-			expected:    sets.NewString("first"),
-		},
-		{
-			name:     "all prowjobs are returned when showHidden is true",
-			selector: labels.Everything().String(),
-			prowJobs: []func(*prowapi.ProwJob) runtime.Object{
-				func(in *prowapi.ProwJob) runtime.Object {
-					in.Name = "first"
-					in.Spec.ExtraRefs = []prowapi.Refs{{Org: "org", Repo: "repo"}}
-					return in
-				},
-				func(in *prowapi.ProwJob) runtime.Object {
-					in.Name = "second"
-					return in
-				},
-			},
-			hiddenRepos: sets.NewString("org/repo"),
-			expected:    sets.NewString("first", "second"),
-			showHidden:  true,
-		},
-		{
-			name: "setting pj.Spec.Hidden hides it",
-			prowJobs: []func(*prowapi.ProwJob) runtime.Object{
-				func(in *prowapi.ProwJob) runtime.Object {
-					in.Name = "hidden"
-					in.Spec.Hidden = true
-					return in
-				},
-				func(in *prowapi.ProwJob) runtime.Object {
-					in.Name = "shown"
-					return in
-				},
-			},
-			expected: sets.NewString("shown"),
-		},
-	}
-
-	for _, testCase := range testCases {
-		var data []runtime.Object
-		for _, generator := range testCase.prowJobs {
-			data = append(data, generator(templateJob.DeepCopy()))
-		}
-		fakeProwJobClient := fake.NewSimpleClientset(data...)
-		if testCase.listErr {
-			fakeProwJobClient.PrependReactor("*", "*", func(action clienttesting.Action) (handled bool, ret runtime.Object, err error) {
-				return true, nil, errors.New("could not list ProwJobs")
-			})
-		}
-		lister := filteringProwJobLister{
-			client:      fakeProwJobClient.ProwV1().ProwJobs("prowjobs"),
-			hiddenRepos: testCase.hiddenRepos,
-			hiddenOnly:  testCase.hiddenOnly,
-			showHidden:  testCase.showHidden,
-		}
-
-		filtered, err := lister.ListProwJobs(testCase.selector)
-		if err == nil && testCase.expectedErr {
-			t.Errorf("%s: expected an error but got none", testCase.name)
-		}
-		if err != nil && !testCase.expectedErr {
-			t.Errorf("%s: expected no error but got one: %v", testCase.name, err)
-		}
-
-		filteredNames := sets.NewString()
-		for _, prowJob := range filtered {
-			filteredNames.Insert(prowJob.Name)
-		}
-
-		if missing := testCase.expected.Difference(filteredNames); missing.Len() > 0 {
-			t.Errorf("%s: did not get expected jobs in filtered list: %v", testCase.name, missing.List())
-		}
-		if extra := filteredNames.Difference(testCase.expected); extra.Len() > 0 {
-			t.Errorf("%s: got unexpected jobs in filtered list: %v", testCase.name, extra.List())
-		}
-	}
-}
-
 func Test_gatherOptions(t *testing.T) {
 	cases := []struct {
 		name     string
@@ -901,16 +810,7 @@ func Test_gatherOptions(t *testing.T) {
 				"--config-path": "/random/value",
 			},
 			expected: func(o *options) {
-				o.configPath = "/random/value"
-			},
-		},
-		{
-			name: "empty config-path defaults to old value",
-			args: map[string]string{
-				"--config-path": "",
-			},
-			expected: func(o *options) {
-				o.configPath = config.DefaultConfigPath
+				o.config.ConfigPath = "/random/value"
 			},
 		},
 		{
@@ -933,10 +833,20 @@ func Test_gatherOptions(t *testing.T) {
 	for _, tc := range cases {
 		fs := flag.NewFlagSet("fake-flags", flag.PanicOnError)
 		ghoptions := flagutil.GitHubOptions{}
-		ghoptions.AddFlagsWithoutDefaultGitHubTokenPath(fs)
+		ghoptions.AddFlags(fs)
+		ghoptions.AllowAnonymous = true
+		ghoptions.AllowDirectAccess = true
 		t.Run(tc.name, func(t *testing.T) {
 			expected := &options{
-				configPath:            "yo",
+				config: configflagutil.ConfigOptions{
+					ConfigPathFlagName:                    "config-path",
+					JobConfigPathFlagName:                 "job-config-path",
+					ConfigPath:                            "yo",
+					SupplementalProwConfigsFileNameSuffix: "_prowconfig.yaml",
+				},
+				pluginsConfig: pluginsflagutil.PluginOptions{
+					SupplementalPluginsConfigsFileNameSuffix: "_pluginconfig.yaml",
+				},
 				githubOAuthConfigFile: "/etc/github/secret",
 				cookieSecretFile:      "",
 				staticFilesLocation:   "/static",
@@ -944,6 +854,7 @@ func Test_gatherOptions(t *testing.T) {
 				spyglassFilesLocation: "/lenses",
 				kubernetes:            flagutil.KubernetesOptions{},
 				github:                ghoptions,
+				instrumentation:       flagutil.DefaultInstrumentationOptions(),
 			}
 			if tc.expected != nil {
 				tc.expected(expected)
@@ -973,7 +884,7 @@ func Test_gatherOptions(t *testing.T) {
 			case tc.err:
 				t.Errorf("failed to receive expected error")
 			case !reflect.DeepEqual(*expected, actual):
-				t.Errorf("\n%#v\n!= expected\n%#v", actual, *expected)
+				t.Errorf("actual differs from expected: %s", cmp.Diff(actual, *expected, cmp.Exporter(func(_ reflect.Type) bool { return true })))
 			}
 		})
 	}
@@ -984,7 +895,7 @@ func TestHandleConfig(t *testing.T) {
 	trueVal := true
 	c := config.Config{
 		JobConfig: config.JobConfig{
-			Presubmits: map[string][]config.Presubmit{
+			PresubmitsStatic: map[string][]config.Presubmit{
 				"org/repo": {
 					{
 						Reporter: config.Reporter{
@@ -1054,11 +965,11 @@ func TestHandleConfig(t *testing.T) {
 
 func TestHandlePluginConfig(t *testing.T) {
 	c := plugins.Configuration{
-		Plugins: map[string][]string{
-			"org/repo": {
+		Plugins: plugins.Plugins{
+			"org/repo": {Plugins: []string{
 				"approve",
 				"lgtm",
-			},
+			}},
 		},
 		Blunderbuss: plugins.Blunderbuss{
 			ExcludeApprovers: true,
@@ -1091,5 +1002,247 @@ func TestHandlePluginConfig(t *testing.T) {
 	}
 	if !reflect.DeepEqual(c, res) {
 		t.Errorf("Invalid config. Got %v, expected %v", res, c)
+	}
+}
+
+func cfgWithLensNamed(lensName string) *config.Config {
+	return &config.Config{
+		ProwConfig: config.ProwConfig{
+			Deck: config.Deck{
+				Spyglass: config.Spyglass{
+					Lenses: []config.LensFileConfig{{
+						Lens: config.LensConfig{
+							Name: lensName,
+						},
+					}},
+				},
+			},
+		},
+	}
+}
+
+func verifyCfgHasRemoteForLens(lensName string) func(*config.Config, error) error {
+	return func(c *config.Config, err error) error {
+		if err != nil {
+			return fmt.Errorf("got unexpected error: %w", err)
+		}
+
+		var found bool
+		for _, lens := range c.Deck.Spyglass.Lenses {
+			if lens.Lens.Name != lensName {
+				continue
+			}
+			found = true
+
+			if lens.RemoteConfig == nil {
+				return errors.New("remoteConfig for lens was nil")
+			}
+
+			if lens.RemoteConfig.Endpoint == "" {
+				return errors.New("endpoint was unset")
+			}
+
+			if lens.RemoteConfig.ParsedEndpoint == nil {
+				return errors.New("parsedEndpoint was nil")
+			}
+			if expected := common.DyanmicPathForLens(lensName); lens.RemoteConfig.ParsedEndpoint.Path != expected {
+				return fmt.Errorf("expected parsedEndpoint.Path to be %q, was %q", expected, lens.RemoteConfig.ParsedEndpoint.Path)
+			}
+			if lens.RemoteConfig.ParsedEndpoint.Scheme != "http" {
+				return fmt.Errorf("expected parsedEndpoint.scheme to be 'http', was %q", lens.RemoteConfig.ParsedEndpoint.Scheme)
+			}
+			if lens.RemoteConfig.ParsedEndpoint.Host != spyglassLocalLensListenerAddr {
+				return fmt.Errorf("expected parsedEndpoint.Host to be %q, was %q", spyglassLocalLensListenerAddr, lens.RemoteConfig.ParsedEndpoint.Host)
+			}
+			if lens.RemoteConfig.Title == "" {
+				return errors.New("expected title to be set")
+			}
+			if lens.RemoteConfig.Priority == nil {
+				return errors.New("expected priority to be set")
+			}
+			if lens.RemoteConfig.HideTitle == nil {
+				return errors.New("expected HideTitle to be set")
+			}
+		}
+
+		if !found {
+			return fmt.Errorf("no config found for lens %q", lensName)
+		}
+
+		return nil
+	}
+
+}
+
+func TestSpyglassConfigDefaulting(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name   string
+		in     *config.Config
+		verify func(*config.Config, error) error
+	}{
+		{
+			name:   "buildlog lens gets defaulted",
+			in:     cfgWithLensNamed("buildlog"),
+			verify: verifyCfgHasRemoteForLens("buildlog"),
+		},
+		{
+			name:   "coverage lens gets defaulted",
+			in:     cfgWithLensNamed("coverage"),
+			verify: verifyCfgHasRemoteForLens("coverage"),
+		},
+		{
+			name:   "junit lens gets defaulted",
+			in:     cfgWithLensNamed("junit"),
+			verify: verifyCfgHasRemoteForLens("junit"),
+		},
+		{
+			name:   "metadata lens gets defaulted",
+			in:     cfgWithLensNamed("metadata"),
+			verify: verifyCfgHasRemoteForLens("metadata"),
+		},
+		{
+			name:   "podinfo lens gets defaulted",
+			in:     cfgWithLensNamed("podinfo"),
+			verify: verifyCfgHasRemoteForLens("podinfo"),
+		},
+		{
+			name:   "restcoverage lens gets defaulted",
+			in:     cfgWithLensNamed("restcoverage"),
+			verify: verifyCfgHasRemoteForLens("restcoverage"),
+		},
+		{
+			name: "undef lens defaulting fails",
+			in:   cfgWithLensNamed("undef"),
+			verify: func(_ *config.Config, err error) error {
+				expectedErrMsg := `lens "undef" has no remote_config and could not get default: invalid lens name`
+				if err == nil || err.Error() != expectedErrMsg {
+					return fmt.Errorf("expected err to be %q, was %v", expectedErrMsg, err)
+				}
+				return nil
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := tc.verify(tc.in, spglassConfigDefaulting(tc.in)); err != nil {
+				t.Error(err)
+			}
+		})
+	}
+}
+
+func TestHandleGitHubLink(t *testing.T) {
+	ghoptions := flagutil.GitHubOptions{Host: "github.mycompany.com"}
+	org, repo := "org", "repo"
+	handler := HandleGitHubLink(ghoptions.Host, true)
+	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("/github-link?dest=%s/%s", org, repo), nil)
+	if err != nil {
+		t.Fatalf("Error making request: %v", err)
+	}
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusFound {
+		t.Fatalf("Bad error code: %d", rr.Code)
+	}
+	resp := rr.Result()
+	defer resp.Body.Close()
+	actual := resp.Header.Get("Location")
+	expected := fmt.Sprintf("https://%s/%s/%s", ghoptions.Host, org, repo)
+	if expected != actual {
+		t.Fatalf("%v", actual)
+	}
+}
+
+func TestCanTriggerJob(t *testing.T) {
+	t.Parallel()
+	org := "org"
+	trustedUser := "trusted"
+	untrustedUser := "untrusted"
+
+	pcfg := &plugins.Configuration{
+		Triggers: []plugins.Trigger{{Repos: []string{org}}},
+	}
+	pcfgGetter := func() *plugins.Configuration { return pcfg }
+
+	ghc := fakegithub.NewFakeClient()
+	ghc.OrgMembers = map[string][]string{org: {trustedUser}}
+
+	pj := prowapi.ProwJob{
+		Spec: prowapi.ProwJobSpec{
+			Refs: &prowapi.Refs{
+				Org:   org,
+				Repo:  "repo",
+				Pulls: []prowapi.Pull{{Author: trustedUser}},
+			},
+			Type: prowapi.PresubmitJob,
+		},
+	}
+	testCases := []struct {
+		name          string
+		user          string
+		expectAllowed bool
+	}{
+		{
+			name:          "Unauthorized user can not rerun",
+			user:          untrustedUser,
+			expectAllowed: false,
+		},
+		{
+			name:          "Authorized user can re-run",
+			user:          trustedUser,
+			expectAllowed: true,
+		},
+	}
+
+	log := logrus.NewEntry(logrus.StandardLogger())
+	for _, tc := range testCases {
+		result, err := canTriggerJob(tc.user, pj, nil, ghc, pcfgGetter, log)
+		if err != nil {
+			t.Fatalf("error: %v", err)
+		}
+		if result != tc.expectAllowed {
+			t.Errorf("got result %t, expected %t", result, tc.expectAllowed)
+		}
+	}
+}
+
+func TestHttpStatusForError(t *testing.T) {
+	testCases := []struct {
+		name           string
+		input          error
+		expectedStatus int
+	}{
+		{
+			name:           "normal_error",
+			input:          errors.New("some error message"),
+			expectedStatus: http.StatusInternalServerError,
+		},
+		{
+			name: "httpError",
+			input: httpError{
+				error:      errors.New("some error message"),
+				statusCode: http.StatusGone,
+			},
+			expectedStatus: http.StatusGone,
+		},
+		{
+			name: "httpError_wrapped",
+			input: fmt.Errorf("wrapped error: %w", httpError{
+				error:      errors.New("some error message"),
+				statusCode: http.StatusGone,
+			}),
+			expectedStatus: http.StatusGone,
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(nested *testing.T) {
+			actual := httpStatusForError(tc.input)
+			if actual != tc.expectedStatus {
+				t.Fatalf("unexpected HTTP status (expected=%v, actual=%v) for error: %v", tc.expectedStatus, actual, tc.input)
+			}
+		})
 	}
 }

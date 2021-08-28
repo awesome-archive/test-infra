@@ -23,7 +23,6 @@ import (
 	"github.com/sirupsen/logrus"
 
 	"k8s.io/test-infra/prow/config"
-	"k8s.io/test-infra/prow/git"
 	"k8s.io/test-infra/prow/github"
 	"k8s.io/test-infra/prow/github/fakegithub"
 )
@@ -297,32 +296,34 @@ func TestSkipStatus(t *testing.T) {
 			t.Fatalf("%s: could not set presubmit regexes: %v", test.name, err)
 		}
 
-		fghc := &fakegithub.FakeClient{
-			IssueComments: make(map[int][]github.IssueComment),
-			PullRequests: map[int]*github.PullRequest{
-				test.event.Number: {
-					Head: github.PullRequestBranch{
-						SHA: test.sha,
-					},
+		fghc := fakegithub.NewFakeClient()
+		fghc.IssueComments = make(map[int][]github.IssueComment)
+		fghc.PullRequests = map[int]*github.PullRequest{
+			test.event.Number: {
+				Head: github.PullRequestBranch{
+					SHA: test.sha,
 				},
 			},
-			PullRequestChanges: test.prChanges,
-			CreatedStatuses: map[string][]github.Status{
-				test.sha: test.existing,
-			},
-			CombinedStatuses: map[string]*github.CombinedStatus{
-				test.sha: {
-					State:    test.combinedStatus,
-					Statuses: test.existing,
-				},
+		}
+		fghc.PullRequestChanges = test.prChanges
+		fghc.CreatedStatuses = map[string][]github.Status{
+			test.sha: test.existing,
+		}
+		fghc.CombinedStatuses = map[string]*github.CombinedStatus{
+			test.sha: {
+				State:    test.combinedStatus,
+				Statuses: test.existing,
 			},
 		}
 		l := logrus.WithField("plugin", pluginName)
 
-		c := &config.Config{}
-		c.SetTestPresubmits("org/repo", test.presubmits)
+		c := &config.Config{
+			JobConfig: config.JobConfig{
+				PresubmitsStatic: map[string][]config.Presubmit{"org/repo": test.presubmits},
+			},
+		}
 
-		if err := handle(fghc, l, test.event, c, &git.Client{}, true); err != nil {
+		if err := handle(fghc, l, test.event, c, nil, true); err != nil {
 			t.Errorf("%s: unexpected error: %v", test.name, err)
 			continue
 		}

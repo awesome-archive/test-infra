@@ -17,39 +17,39 @@ limitations under the License.
 package main
 
 import (
-	"errors"
+	"context"
 	"flag"
 	"fmt"
 	"os"
 	"time"
-
-	prowjobset "k8s.io/test-infra/prow/client/clientset/versioned"
-	prowjobinfo "k8s.io/test-infra/prow/client/informers/externalversions"
-	"k8s.io/test-infra/prow/config"
-	"k8s.io/test-infra/prow/interrupts"
-	"k8s.io/test-infra/prow/kube"
-	"k8s.io/test-infra/prow/logrusutil"
-	"k8s.io/test-infra/prow/pjutil"
-
-	pipelineset "github.com/tektoncd/pipeline/pkg/client/clientset/versioned"
-	pipelineinfo "github.com/tektoncd/pipeline/pkg/client/informers/externalversions"
-	pipelineinfov1alpha1 "github.com/tektoncd/pipeline/pkg/client/informers/externalversions/pipeline/v1alpha1"
 
 	"github.com/sirupsen/logrus"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
+	"k8s.io/test-infra/prow/pjutil/pprof"
 
 	_ "k8s.io/client-go/plugin/pkg/client/auth/gcp" // support gcp users in .kube/config
+	prowjobset "k8s.io/test-infra/prow/client/clientset/versioned"
+	prowjobinfo "k8s.io/test-infra/prow/client/informers/externalversions"
+	prowflagutil "k8s.io/test-infra/prow/flagutil"
+	configflagutil "k8s.io/test-infra/prow/flagutil/config"
+	"k8s.io/test-infra/prow/interrupts"
+	"k8s.io/test-infra/prow/kube"
+	"k8s.io/test-infra/prow/logrusutil"
+	pipelineset "k8s.io/test-infra/prow/pipeline/clientset/versioned"
+	pipelineinfo "k8s.io/test-infra/prow/pipeline/informers/externalversions"
+	pipelineinfov1alpha1 "k8s.io/test-infra/prow/pipeline/informers/externalversions/pipeline/v1alpha1"
 )
 
 type options struct {
-	allContexts  bool
-	buildCluster string
-	config       string
-	kubeconfig   string
-	totURL       string
+	allContexts            bool
+	buildCluster           string
+	config                 configflagutil.ConfigOptions
+	kubeconfig             string
+	totURL                 string
+	instrumentationOptions prowflagutil.InstrumentationOptions
 }
 
 func parseOptions() options {
@@ -61,20 +61,17 @@ func parseOptions() options {
 }
 
 func (o *options) parse(flags *flag.FlagSet, args []string) error {
+	o.config.ConfigPathFlagName = "config"
 	flags.BoolVar(&o.allContexts, "all-contexts", false, "Monitor all cluster contexts, not just default")
 	flags.StringVar(&o.totURL, "tot-url", "", "Tot URL")
 	flags.StringVar(&o.kubeconfig, "kubeconfig", "", "Path to kubeconfig. Only required if out of cluster")
-	flags.StringVar(&o.config, "config", "", "Path to prow config.yaml")
-	flags.StringVar(&o.buildCluster, "build-cluster", "", "Path to file containing a YAML-marshalled kube.Cluster object. If empty, uses the local cluster.")
+	o.instrumentationOptions.AddFlags(flags)
+	o.config.AddFlags(flags)
 	if err := flags.Parse(args); err != nil {
 		return fmt.Errorf("Parse flags: %v", err)
 	}
-	if o.kubeconfig != "" && o.buildCluster != "" {
-		return errors.New("deprecated --builde-cluster may not be used with --kubeconfig")
-	}
-	if o.buildCluster != "" {
-		// TODO(fejta): change to warn and add a term date after plank migration
-		logrus.Infof("--build-custer is deprecated, please switch to --kubeconfig")
+	if err := o.config.Validate(false); err != nil {
+		return err
 	}
 	return nil
 }
@@ -93,7 +90,7 @@ func newPipelineConfig(cfg rest.Config, stop <-chan struct{}) (*pipelineConfig, 
 
 	// Ensure the pipeline CRD is deployed
 	// TODO(fejta): probably a better way to do this
-	if _, err := bc.TektonV1alpha1().PipelineRuns("").List(metav1.ListOptions{Limit: 1}); err != nil {
+	if _, err := bc.TektonV1alpha1().PipelineRuns("").List(context.TODO(), metav1.ListOptions{Limit: 1}); err != nil {
 		return nil, err
 	}
 
@@ -108,23 +105,20 @@ func newPipelineConfig(cfg rest.Config, stop <-chan struct{}) (*pipelineConfig, 
 }
 
 func main() {
-	logrusutil.ComponentInit("pipeline")
+	logrusutil.ComponentInit()
 
 	o := parseOptions()
 
 	defer interrupts.WaitForGracefulShutdown()
 
-	pjutil.ServePProf()
+	pprof.Instrument(o.instrumentationOptions)
 
-	configAgent := &config.Agent{}
-	if o.config != "" {
-		const ignoreJobConfig = ""
-		if err := configAgent.Start(o.config, ignoreJobConfig); err != nil {
-			logrus.WithError(err).Fatal("failed to load prow config")
-		}
+	configAgent, err := o.config.ConfigAgent()
+	if err != nil {
+		logrus.WithError(err).Fatal("failed to load prow config")
 	}
 
-	configs, err := kube.LoadClusterConfigs(o.kubeconfig, o.buildCluster)
+	configs, err := kube.LoadClusterConfigs(kube.NewConfig(kube.ConfigFile(o.kubeconfig)))
 	if err != nil {
 		logrus.WithError(err).Fatal("Error building client configs")
 	}
@@ -157,11 +151,13 @@ func main() {
 		var bc *pipelineConfig
 		bc, err = newPipelineConfig(cfg, interrupts.Context().Done())
 		if apierrors.IsNotFound(err) {
-			logrus.WithError(err).Warnf("Ignoring %s: knative pipeline CRD not deployed", context)
+			logrus.WithError(err).Infof("Ignoring cluster context %s: tekton pipeline CRD not deployed", context)
 			continue
 		}
+		// Don't panic when a build cluster cannot be reached
 		if err != nil {
-			logrus.WithError(err).Fatalf("Failed to create %s pipeline client", context)
+			logrus.WithError(err).Warningf("Failed to create %s pipeline client", context)
+			continue
 		}
 		pipelineConfigs[context] = *bc
 	}

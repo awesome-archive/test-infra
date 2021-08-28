@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Copyright 2018 The Kubernetes Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -52,8 +52,11 @@ fi
 if [[ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]]; then
   echo "Detected GOOGLE_APPLICATION_CREDENTIALS, activating..." >&2
   gcloud auth activate-service-account --key-file="${GOOGLE_APPLICATION_CREDENTIALS}"
-  gcloud auth configure-docker
 fi
+
+gcloud config get-value account || { echo "Debugging, ignore failure"; true; }
+gcloud auth configure-docker
+gcloud config get-value account || { echo "Debugging, ignore failure"; true; }
 
 # Build and push the current commit, failing on any uncommitted changes.
 new_version="v$(date -u '+%Y%m%d')-$(git describe --tags --always --dirty)"

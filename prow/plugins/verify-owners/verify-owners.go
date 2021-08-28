@@ -21,6 +21,7 @@ import (
 	"io/ioutil"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
@@ -28,25 +29,31 @@ import (
 	"github.com/sirupsen/logrus"
 
 	"k8s.io/apimachinery/pkg/util/sets"
-	"k8s.io/test-infra/prow/git"
+
+	"k8s.io/test-infra/prow/config"
+	"k8s.io/test-infra/prow/git/v2"
 	"k8s.io/test-infra/prow/github"
 	"k8s.io/test-infra/prow/labels"
 	"k8s.io/test-infra/prow/pluginhelp"
 	"k8s.io/test-infra/prow/plugins"
 	"k8s.io/test-infra/prow/plugins/golint"
+	"k8s.io/test-infra/prow/plugins/ownersconfig"
 	"k8s.io/test-infra/prow/plugins/trigger"
 	"k8s.io/test-infra/prow/repoowners"
 )
 
 const (
 	// PluginName defines this plugin's registered name.
-	PluginName                    = "verify-owners"
-	ownersFileName                = "OWNERS"
-	ownersAliasesFileName         = "OWNERS_ALIASES"
-	nonCollaboratorResponseFormat = `The following users are mentioned in %s file(s) but are not members of the %s org.
-
-Once all users have been added as [members](%s) of the org, you can trigger verification by writing ` + "`/verify-owners`" + ` in a comment.`
+	PluginName              = "verify-owners"
+	untrustedResponseFormat = `The following users are mentioned in %s file(s) but are untrusted for the following reasons. One way to make the user trusted is to add them as [members](%s) of the %s org. You can then trigger verification by writing ` + "`/verify-owners`" + ` in a comment.`
 )
+
+type nonTrustedReasons struct {
+	// files is a list of files they are being added in
+	files []string
+	// triggerReason is the reason that trigger's TrustedUser responds with for a failed trust check
+	triggerReason string
+}
 
 var (
 	verifyOwnersRe = regexp.MustCompile(`(?mi)^/verify-owners\s*$`)
@@ -57,15 +64,27 @@ func init() {
 	plugins.RegisterGenericCommentHandler(PluginName, handleGenericCommentEvent, helpProvider)
 }
 
-func helpProvider(config *plugins.Configuration, enabledRepos []string) (*pluginhelp.PluginHelp, error) {
+func helpProvider(c *plugins.Configuration, orgRepo []config.OrgRepo) (*pluginhelp.PluginHelp, error) {
 	pluginHelp := &pluginhelp.PluginHelp{
-		Description: fmt.Sprintf("The verify-owners plugin validates %s and %s files and ensures that they always contain collaborators of the org, if they are modified in a PR. On validation failure it automatically adds the '%s' label to the PR, and a review comment on the incriminating file(s).", ownersFileName, ownersAliasesFileName, labels.InvalidOwners),
+		Description: fmt.Sprintf("The verify-owners plugin validates %s and %s files (by default) and ensures that they always contain collaborators of the org, if they are modified in a PR. On validation failure it automatically adds the '%s' label to the PR, and a review comment on the incriminating file(s). Per-repo configuration for filenames is possible.", ownersconfig.DefaultOwnersFile, ownersconfig.DefaultOwnersAliasesFile, labels.InvalidOwners),
+		Config:      map[string]string{},
 	}
-	if config.Owners.LabelsBlackList != nil {
-		pluginHelp.Config = map[string]string{
-			"": fmt.Sprintf(`The verify-owners plugin will complain if %s files contain any of the following blacklisted labels: %s.`,
-				ownersFileName,
-				strings.Join(config.Owners.LabelsBlackList, ", ")),
+	defaultFilenames := c.OwnersFilenames("", "")
+	descriptionFor := func(filenames ownersconfig.Filenames) string {
+		description := fmt.Sprintf("%s and %s files are validated.", filenames.Owners, filenames.OwnersAliases)
+		if c.Owners.LabelsDenyList != nil {
+			description = fmt.Sprintf(`%s The verify-owners plugin will complain if %s files contain any of the following banned labels: %s.`,
+				description,
+				filenames.Owners,
+				strings.Join(c.Owners.LabelsDenyList, ", "))
+		}
+		return description
+	}
+	pluginHelp.Config["default"] = descriptionFor(defaultFilenames)
+	for _, item := range orgRepo {
+		filenames := c.OwnersFilenames(item.Org, item.Repo)
+		if !reflect.DeepEqual(filenames, defaultFilenames) {
+			pluginHelp.Config[item.String()] = descriptionFor(filenames)
 		}
 	}
 	pluginHelp.AddCommand(pluginhelp.Command{
@@ -97,6 +116,7 @@ type githubClient interface {
 	GetPullRequest(org, repo string, number int) (*github.PullRequest, error)
 	RemoveLabel(owner, repo string, number int, label string) error
 	GetIssueLabels(org, repo string, number int) ([]github.Label, error)
+	BotUserChecker() (func(candidate string) bool, error)
 }
 
 type commentPruner interface {
@@ -122,7 +142,7 @@ func handlePullRequest(pc plugins.Agent, pre github.PullRequestEvent) error {
 
 	var skipTrustedUserCheck bool
 	for _, r := range pc.PluginConfig.Owners.SkipCollaborators {
-		if r == pre.Repo.Name {
+		if r == pre.Repo.FullName {
 			skipTrustedUserCheck = true
 			break
 		}
@@ -135,7 +155,7 @@ func handlePullRequest(pc plugins.Agent, pre github.PullRequestEvent) error {
 		number:       pre.Number,
 	}
 
-	return handle(pc.GitHubClient, pc.GitClient, pc.OwnersClient, pc.Logger, &pre.PullRequest, prInfo, pc.PluginConfig.Owners.LabelsBlackList, pc.PluginConfig.TriggerFor(pre.Repo.Owner.Login, pre.Repo.Name), skipTrustedUserCheck, cp)
+	return handle(pc.GitHubClient, pc.GitClient, pc.OwnersClient, pc.Logger, &pre.PullRequest, prInfo, pc.PluginConfig.Owners.LabelsDenyList, pc.PluginConfig.TriggerFor(pre.Repo.Owner.Login, pre.Repo.Name), skipTrustedUserCheck, cp, pc.PluginConfig.OwnersFilenames)
 }
 
 func handleGenericCommentEvent(pc plugins.Agent, e github.GenericCommentEvent) error {
@@ -146,16 +166,16 @@ func handleGenericCommentEvent(pc plugins.Agent, e github.GenericCommentEvent) e
 
 	var skipTrustedUserCheck bool
 	for _, r := range pc.PluginConfig.Owners.SkipCollaborators {
-		if r == e.Repo.Name {
+		if r == e.Repo.FullName {
 			skipTrustedUserCheck = true
 			break
 		}
 	}
 
-	return handleGenericComment(pc.GitHubClient, pc.GitClient, pc.OwnersClient, pc.Logger, &e, pc.PluginConfig.Owners.LabelsBlackList, pc.PluginConfig.TriggerFor(e.Repo.Owner.Login, e.Repo.Name), skipTrustedUserCheck, cp)
+	return handleGenericComment(pc.GitHubClient, pc.GitClient, pc.OwnersClient, pc.Logger, &e, pc.PluginConfig.Owners.LabelsDenyList, pc.PluginConfig.TriggerFor(e.Repo.Owner.Login, e.Repo.Name), skipTrustedUserCheck, cp, pc.PluginConfig.OwnersFilenames)
 }
 
-func handleGenericComment(ghc githubClient, gc *git.Client, roc repoownersClient, log *logrus.Entry, ce *github.GenericCommentEvent, labelsBlackList []string, triggerConfig plugins.Trigger, skipTrustedUserCheck bool, cp commentPruner) error {
+func handleGenericComment(ghc githubClient, gc git.ClientFactory, roc repoownersClient, log *logrus.Entry, ce *github.GenericCommentEvent, bannedLabels []string, triggerConfig plugins.Trigger, skipTrustedUserCheck bool, cp commentPruner, resolver ownersconfig.Resolver) error {
 	// Only consider open PRs and new comments.
 	if ce.IssueState != "open" || !ce.IsPR || ce.Action != github.GenericCommentActionCreated {
 		return nil
@@ -177,7 +197,7 @@ func handleGenericComment(ghc githubClient, gc *git.Client, roc repoownersClient
 		return err
 	}
 
-	return handle(ghc, gc, roc, log, pr, prInfo, labelsBlackList, triggerConfig, skipTrustedUserCheck, cp)
+	return handle(ghc, gc, roc, log, pr, prInfo, bannedLabels, triggerConfig, skipTrustedUserCheck, cp, resolver)
 }
 
 type messageWithLine struct {
@@ -185,10 +205,11 @@ type messageWithLine struct {
 	message string
 }
 
-func handle(ghc githubClient, gc *git.Client, roc repoownersClient, log *logrus.Entry, pr *github.PullRequest, info info, labelsBlackList []string, triggerConfig plugins.Trigger, skipTrustedUserCheck bool, cp commentPruner) error {
+func handle(ghc githubClient, gc git.ClientFactory, roc repoownersClient, log *logrus.Entry, pr *github.PullRequest, info info, bannedLabels []string, triggerConfig plugins.Trigger, skipTrustedUserCheck bool, cp commentPruner, resolver ownersconfig.Resolver) error {
 	org := info.org
 	repo := info.repo
 	number := info.number
+	filenames := resolver(org, repo)
 	wrongOwnersFiles := map[string]messageWithLine{}
 
 	// Get changes.
@@ -200,7 +221,7 @@ func handle(ghc githubClient, gc *git.Client, roc repoownersClient, log *logrus.
 	// List modified OWNERS files.
 	var modifiedOwnersFiles []github.PullRequestChange
 	for _, change := range changes {
-		if filepath.Base(change.Filename) == ownersFileName && change.Status != github.PullRequestFileRemoved {
+		if filepath.Base(change.Filename) == filenames.Owners && change.Status != github.PullRequestFileRemoved {
 			modifiedOwnersFiles = append(modifiedOwnersFiles, change)
 		}
 	}
@@ -209,19 +230,25 @@ func handle(ghc githubClient, gc *git.Client, roc repoownersClient, log *logrus.
 	var modifiedOwnerAliasesFile github.PullRequestChange
 	var ownerAliasesModified bool
 	for _, change := range changes {
-		if change.Filename == ownersAliasesFileName {
+		if change.Filename == filenames.OwnersAliases {
 			modifiedOwnerAliasesFile = change
 			ownerAliasesModified = true
 			break
 		}
 	}
 
-	if len(modifiedOwnersFiles) == 0 && !ownerAliasesModified {
+	issueLabels, err := ghc.GetIssueLabels(org, repo, number)
+	if err != nil {
+		return err
+	}
+	hasInvalidOwnersLabel := github.HasLabel(labels.InvalidOwners, issueLabels)
+
+	if len(modifiedOwnersFiles) == 0 && !ownerAliasesModified && !hasInvalidOwnersLabel {
 		return nil
 	}
 
 	// Clone the repo, checkout the PR.
-	r, err := gc.Clone(info.repoFullName)
+	r, err := gc.ClientFor(org, repo)
 	if err != nil {
 		return err
 	}
@@ -230,19 +257,21 @@ func handle(ghc githubClient, gc *git.Client, roc repoownersClient, log *logrus.
 			log.WithError(err).Error("Error cleaning up repo.")
 		}
 	}()
-	if err := r.CheckoutPullRequest(number); err != nil {
+	if err := r.Config("user.name", "prow"); err != nil {
 		return err
 	}
-	// If we have a specific SHA, use it.
-	if pr.Head.SHA != "" {
-		if err := r.Checkout(pr.Head.SHA); err != nil {
-			return err
-		}
+	if err := r.Config("user.email", "prow@localhost"); err != nil {
+		return err
 	}
-
+	if err := r.Config("commit.gpgsign", "false"); err != nil {
+		log.WithError(err).Errorf("Cannot set gpgsign=false in gitconfig: %v", err)
+	}
+	if err := r.MergeAndCheckout(pr.Base.Ref, string(github.MergeMerge), pr.Head.SHA); err != nil {
+		return err
+	}
 	// If OWNERS_ALIASES file exists, get all aliases.
 	// If the file was modified, check for non trusted users in the newly added owners.
-	nonTrustedUsers, repoAliases, err := nonTrustedUsersInOwnersAliases(ghc, log, triggerConfig, org, repo, r.Dir, modifiedOwnerAliasesFile.Patch, ownerAliasesModified, skipTrustedUserCheck)
+	nonTrustedUsers, trustedUsers, repoAliases, err := nonTrustedUsersInOwnersAliases(ghc, log, triggerConfig, org, repo, r.Directory(), modifiedOwnerAliasesFile.Patch, ownerAliasesModified, skipTrustedUserCheck, filenames)
 	if err != nil {
 		return err
 	}
@@ -255,27 +284,20 @@ func handle(ghc githubClient, gc *git.Client, roc repoownersClient, log *logrus.
 	}
 
 	for _, c := range modifiedOwnersFiles {
-		path := filepath.Join(r.Dir, c.Filename)
-		msg, owners := parseOwnersFile(oc, path, c, log, labelsBlackList)
+		path := filepath.Join(r.Directory(), c.Filename)
+		msg, owners := parseOwnersFile(oc, path, c, log, bannedLabels, filenames)
 		if msg != nil {
 			wrongOwnersFiles[c.Filename] = *msg
 			continue
 		}
 
 		if !skipTrustedUserCheck {
-			nonTrustedUsers, err = nonTrustedUsersInOwners(ghc, log, triggerConfig, org, repo, c.Patch, c.Filename, owners, nonTrustedUsers, repoAliases)
+			nonTrustedUsers, err = nonTrustedUsersInOwners(ghc, log, triggerConfig, org, repo, c.Patch, c.Filename, owners, nonTrustedUsers, trustedUsers, repoAliases)
 			if err != nil {
 				return err
 			}
 		}
 	}
-
-	// React if there are files with incorrect configs or non-trusted users.
-	issueLabels, err := ghc.GetIssueLabels(org, repo, number)
-	if err != nil {
-		return err
-	}
-	hasInvalidOwnersLabel := github.HasLabel(labels.InvalidOwners, issueLabels)
 
 	if len(wrongOwnersFiles) > 0 {
 		s := "s"
@@ -287,7 +309,7 @@ func handle(ghc githubClient, gc *git.Client, roc repoownersClient, log *logrus.
 				return err
 			}
 		}
-		log.Debugf("Creating a review for %d %s file%s.", len(wrongOwnersFiles), ownersFileName, s)
+		log.Debugf("Creating a review for %d %s file%s.", len(wrongOwnersFiles), filenames.Owners, s)
 		var comments []github.DraftReviewComment
 		for errFile, err := range wrongOwnersFiles {
 			comments = append(comments, github.DraftReviewComment{
@@ -297,7 +319,7 @@ func handle(ghc githubClient, gc *git.Client, roc repoownersClient, log *logrus.
 			})
 		}
 		// Make the review body.
-		response := fmt.Sprintf("%d invalid %s file%s", len(wrongOwnersFiles), ownersFileName, s)
+		response := fmt.Sprintf("%d invalid %s file%s", len(wrongOwnersFiles), filenames.Owners, s)
 		draftReview := github.DraftReview{
 			Body:     plugins.FormatResponseRaw(pr.Body, pr.HTMLURL, pr.User.Login, response),
 			Action:   github.Comment,
@@ -308,7 +330,7 @@ func handle(ghc githubClient, gc *git.Client, roc repoownersClient, log *logrus.
 		}
 		err := ghc.CreateReview(org, repo, number, draftReview)
 		if err != nil {
-			return fmt.Errorf("error creating a review for invalid %s file%s: %v", ownersFileName, s, err)
+			return fmt.Errorf("error creating a review for invalid %s file%s: %v", filenames.Owners, s, err)
 		}
 	}
 
@@ -321,10 +343,10 @@ func handle(ghc githubClient, gc *git.Client, roc repoownersClient, log *logrus.
 
 		// prune old comments before adding a new one
 		cp.PruneComments(func(comment github.IssueComment) bool {
-			return strings.Contains(comment.Body, fmt.Sprintf(nonCollaboratorResponseFormat, ownersFileName, org, triggerConfig.JoinOrgURL))
+			return strings.Contains(comment.Body, fmt.Sprintf(untrustedResponseFormat, filenames.Owners, triggerConfig.JoinOrgURL, org))
 		})
-		if err := ghc.CreateComment(org, repo, number, markdownFriendlyComment(org, triggerConfig.JoinOrgURL, nonTrustedUsers)); err != nil {
-			log.WithError(err).Errorf("Could not create comment for listing non-collaborators in %s files", ownersFileName)
+		if err := ghc.CreateComment(org, repo, number, markdownFriendlyComment(org, triggerConfig.JoinOrgURL, nonTrustedUsers, filenames)); err != nil {
+			log.WithError(err).Errorf("Could not create comment for listing non-collaborators in %s files", filenames.Owners)
 		}
 	}
 
@@ -335,14 +357,14 @@ func handle(ghc githubClient, gc *git.Client, roc repoownersClient, log *logrus.
 			return fmt.Errorf("failed removing %s label: %v", labels.InvalidOwners, err)
 		}
 		cp.PruneComments(func(comment github.IssueComment) bool {
-			return strings.Contains(comment.Body, fmt.Sprintf(nonCollaboratorResponseFormat, ownersFileName, org, triggerConfig.JoinOrgURL))
+			return strings.Contains(comment.Body, fmt.Sprintf(untrustedResponseFormat, filenames.Owners, triggerConfig.JoinOrgURL, org))
 		})
 	}
 
 	return nil
 }
 
-func parseOwnersFile(oc ownersClient, path string, c github.PullRequestChange, log *logrus.Entry, labelsBlackList []string) (*messageWithLine, []string) {
+func parseOwnersFile(oc ownersClient, path string, c github.PullRequestChange, log *logrus.Entry, bannedLabels []string, filenames ownersconfig.Filenames) (*messageWithLine, []string) {
 	var reviewers []string
 	var approvers []string
 	var labels []string
@@ -390,53 +412,55 @@ func parseOwnersFile(oc ownersClient, path string, c github.PullRequestChange, l
 		approvers = simple.Config.Approvers
 		labels = simple.Config.Labels
 	}
-	// Check labels against blacklist
-	if sets.NewString(labels...).HasAny(labelsBlackList...) {
+	// Check labels against ban list
+	if sets.NewString(labels...).HasAny(bannedLabels...) {
 		return &messageWithLine{
 			lineNumber,
-			fmt.Sprintf("File contains blacklisted labels: %s.", sets.NewString(labels...).Intersection(sets.NewString(labelsBlackList...)).List()),
+			fmt.Sprintf("File contains banned labels: %s.", sets.NewString(labels...).Intersection(sets.NewString(bannedLabels...)).List()),
 		}, nil
 	}
 	// Check approvers isn't empty
 	if filepath.Dir(c.Filename) == "." && len(approvers) == 0 {
 		return &messageWithLine{
 			lineNumber,
-			fmt.Sprintf("No approvers defined in this root directory %s file.", ownersFileName),
+			fmt.Sprintf("No approvers defined in this root directory %s file.", filenames.Owners),
 		}, nil
 	}
 	owners := append(reviewers, approvers...)
 	return nil, owners
 }
 
-func markdownFriendlyComment(org, joinOrgURL string, nonTrustedUsers map[string][]string) string {
+func markdownFriendlyComment(org, joinOrgURL string, nonTrustedUsers map[string]nonTrustedReasons, filenames ownersconfig.Filenames) string {
 	var commentLines []string
-	commentLines = append(commentLines, fmt.Sprintf(nonCollaboratorResponseFormat, ownersFileName, org, joinOrgURL))
+	commentLines = append(commentLines, fmt.Sprintf(untrustedResponseFormat, filenames.Owners, joinOrgURL, org))
 
-	for user, ownersFiles := range nonTrustedUsers {
+	for user, reasons := range nonTrustedUsers {
 		commentLines = append(commentLines, fmt.Sprintf("- %s", user))
-		for _, filename := range ownersFiles {
+		commentLines = append(commentLines, fmt.Sprintf("  - %s", reasons.triggerReason))
+		for _, filename := range reasons.files {
 			commentLines = append(commentLines, fmt.Sprintf("  - %s", filename))
 		}
 	}
 	return strings.Join(commentLines, "\n")
 }
 
-func nonTrustedUsersInOwnersAliases(ghc githubClient, log *logrus.Entry, triggerConfig plugins.Trigger, org, repo, dir, patch string, ownerAliasesModified, skipTrustedUserCheck bool) (map[string][]string, repoowners.RepoAliases, error) {
+func nonTrustedUsersInOwnersAliases(ghc githubClient, log *logrus.Entry, triggerConfig plugins.Trigger, org, repo, dir, patch string, ownerAliasesModified, skipTrustedUserCheck bool, filenames ownersconfig.Filenames) (map[string]nonTrustedReasons, sets.String, repoowners.RepoAliases, error) {
 	repoAliases := make(repoowners.RepoAliases)
-	// nonTrustedUsers is a map of non-trusted users to the list of files they are being added in
-	nonTrustedUsers := map[string][]string{}
+	// nonTrustedUsers is a map of non-trusted users to the reasons they were not trusted
+	nonTrustedUsers := map[string]nonTrustedReasons{}
+	trustedUsers := sets.String{}
 	var err error
 
 	// If OWNERS_ALIASES exists, get all aliases.
-	path := filepath.Join(dir, ownersAliasesFileName)
+	path := filepath.Join(dir, filenames.OwnersAliases)
 	if _, err := os.Stat(path); err == nil {
 		b, err := ioutil.ReadFile(path)
 		if err != nil {
-			return nonTrustedUsers, repoAliases, fmt.Errorf("Failed to read %s: %v", path, err)
+			return nonTrustedUsers, trustedUsers, repoAliases, fmt.Errorf("Failed to read %s: %v", path, err)
 		}
 		repoAliases, err = repoowners.ParseAliasesConfig(b)
 		if err != nil {
-			return nonTrustedUsers, repoAliases, fmt.Errorf("error parsing aliases config for %s file: %v", ownersAliasesFileName, err)
+			return nonTrustedUsers, trustedUsers, repoAliases, fmt.Errorf("error parsing aliases config for %s file: %v", filenames.OwnersAliases, err)
 		}
 	}
 
@@ -444,34 +468,25 @@ func nonTrustedUsersInOwnersAliases(ghc githubClient, log *logrus.Entry, trigger
 	if ownerAliasesModified && !skipTrustedUserCheck {
 		allOwners := repoAliases.ExpandAllAliases().List()
 		for _, owner := range allOwners {
-			// cap the number of checks to avoid exhausting tokens in case of large OWNERS refactors.
-			if len(nonTrustedUsers) > 20 {
-				break
-			}
-			nonTrustedUsers, err = checkIfTrustedUser(ghc, log, triggerConfig, owner, patch, ownersAliasesFileName, org, repo, nonTrustedUsers, repoAliases)
+			nonTrustedUsers, err = checkIfTrustedUser(ghc, log, triggerConfig, owner, patch, filenames.OwnersAliases, org, repo, nonTrustedUsers, trustedUsers, repoAliases)
 			if err != nil {
-				return nonTrustedUsers, repoAliases, err
+				return nonTrustedUsers, trustedUsers, repoAliases, err
 			}
 		}
 	}
 
-	return nonTrustedUsers, repoAliases, nil
+	return nonTrustedUsers, trustedUsers, repoAliases, nil
 }
 
-func nonTrustedUsersInOwners(ghc githubClient, log *logrus.Entry, triggerConfig plugins.Trigger, org, repo, patch, fileName string, owners []string, nonTrustedUsers map[string][]string, repoAliases repoowners.RepoAliases) (map[string][]string, error) {
+func nonTrustedUsersInOwners(ghc githubClient, log *logrus.Entry, triggerConfig plugins.Trigger, org, repo, patch, fileName string, owners []string, nonTrustedUsers map[string]nonTrustedReasons, trustedUsers sets.String, repoAliases repoowners.RepoAliases) (map[string]nonTrustedReasons, error) {
 	var err error
 	for _, owner := range owners {
-		// cap the number of checks to avoid exhausting tokens in case of large OWNERS refactors.
-		if len(nonTrustedUsers) > 20 {
-			break
-		}
-
 		// ignore if owner is an alias
 		if _, ok := repoAliases[owner]; ok {
 			continue
 		}
 
-		nonTrustedUsers, err = checkIfTrustedUser(ghc, log, triggerConfig, owner, patch, fileName, org, repo, nonTrustedUsers, repoAliases)
+		nonTrustedUsers, err = checkIfTrustedUser(ghc, log, triggerConfig, owner, patch, fileName, org, repo, nonTrustedUsers, trustedUsers, repoAliases)
 		if err != nil {
 			return nonTrustedUsers, err
 		}
@@ -481,7 +496,12 @@ func nonTrustedUsersInOwners(ghc githubClient, log *logrus.Entry, triggerConfig 
 
 // checkIfTrustedUser looks for newly addded owners by checking if they are in the patch
 // and then checks if the owner is a trusted user.
-func checkIfTrustedUser(ghc githubClient, log *logrus.Entry, triggerConfig plugins.Trigger, owner, patch, fileName, org, repo string, nonTrustedUsers map[string][]string, repoAliases repoowners.RepoAliases) (map[string][]string, error) {
+// returns a map from user to reasons for not being trusted
+func checkIfTrustedUser(ghc githubClient, log *logrus.Entry, triggerConfig plugins.Trigger, owner, patch, fileName, org, repo string, nonTrustedUsers map[string]nonTrustedReasons, trustedUsers sets.String, repoAliases repoowners.RepoAliases) (map[string]nonTrustedReasons, error) {
+	// cap the number of checks to avoid exhausting tokens in case of large OWNERS refactors.
+	if len(nonTrustedUsers)+trustedUsers.Len() > 50 {
+		return nonTrustedUsers, nil
+	}
 	// only consider owners in the current patch
 	newOwnerRe, _ := regexp.Compile(fmt.Sprintf(`\+\s*-\s*\b%s\b`, owner))
 	if !newOwnerRe.MatchString(patch) {
@@ -489,25 +509,42 @@ func checkIfTrustedUser(ghc githubClient, log *logrus.Entry, triggerConfig plugi
 	}
 
 	// if we already flagged the owner for the current file, return early
-	if ownersFiles, ok := nonTrustedUsers[owner]; ok {
-		for _, file := range ownersFiles {
+	if reasons, ok := nonTrustedUsers[owner]; ok {
+		for _, file := range reasons.files {
 			if file == fileName {
 				return nonTrustedUsers, nil
 			}
 		}
+		// have to separate assignment from map update due to map implementation (see "index expressions")
+		reasons.files = append(reasons.files, fileName)
+		nonTrustedUsers[owner] = reasons
+		return nonTrustedUsers, nil
 	}
 
-	isTrustedUser, err := trigger.TrustedUser(ghc, triggerConfig.OnlyOrgMembers, triggerConfig.TrustedOrg, owner, org, repo)
-	if err != nil {
-		return nonTrustedUsers, err
-	}
-
-	if !isTrustedUser {
-		if ownersFiles, ok := nonTrustedUsers[owner]; ok {
-			nonTrustedUsers[owner] = append(ownersFiles, fileName)
-		} else {
-			nonTrustedUsers[owner] = []string{fileName}
+	isAlreadyTrusted := trustedUsers.Has(owner)
+	var err error
+	var triggerTrustedResponse trigger.TrustedUserResponse
+	if !isAlreadyTrusted {
+		triggerTrustedResponse, err = trigger.TrustedUser(ghc, triggerConfig.OnlyOrgMembers, triggerConfig.TrustedOrg, owner, org, repo)
+		if err != nil {
+			return nonTrustedUsers, err
 		}
 	}
+
+	if !isAlreadyTrusted && triggerTrustedResponse.IsTrusted {
+		trustedUsers.Insert(owner)
+	} else if !isAlreadyTrusted && !triggerTrustedResponse.IsTrusted {
+		if reasons, ok := nonTrustedUsers[owner]; ok {
+			reasons.triggerReason = triggerTrustedResponse.Reason
+			nonTrustedUsers[owner] = reasons
+		} else {
+			nonTrustedUsers[owner] = nonTrustedReasons{
+				// ensure that files is initialized to avoid nil pointer
+				files:         []string{},
+				triggerReason: triggerTrustedResponse.Reason,
+			}
+		}
+	}
+
 	return nonTrustedUsers, nil
 }

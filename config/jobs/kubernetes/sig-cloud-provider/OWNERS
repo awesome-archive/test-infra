@@ -1,10 +1,12 @@
 # See the OWNERS docs at https://go.k8s.io/owners
 
+reviewers:
+- andrewsykim
+- cheftako
+- justaugustus
 approvers:
 - andrewsykim
 - cheftako
-- hogepodge
-reviewers:
 - justaugustus
 
 labels:

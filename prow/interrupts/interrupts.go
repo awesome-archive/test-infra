@@ -73,11 +73,18 @@ func handleInterrupt() {
 // will fire first
 var signalsLock = sync.Mutex{}
 
+var signalChannel = make(chan os.Signal, 1)
+
+// Terminate can be called to trigger a termination
+// to the current process.
+func Terminate() {
+	signalChannel <- os.Interrupt
+}
+
 // signals allows for injection of mock signals in testing
 var signals = func() <-chan os.Signal {
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, os.Interrupt, syscall.SIGTERM, syscall.SIGABRT)
-	return sig
+	signal.Notify(signalChannel, os.Interrupt, syscall.SIGTERM)
+	return signalChannel
 }
 
 // wait executes the cancel when an interrupt is seen or if one has already
@@ -145,11 +152,17 @@ func Run(work func(ctx context.Context)) {
 	go wait(cancel)
 }
 
+// ListenAndServer is typically an http.Server
+type ListenAndServer interface {
+	Shutdownable
+	ListenAndServe() error
+}
+
 // ListenAndServe runs the HTTP server and handles shutting it down
 // gracefully on interrupts. This function is not blocking. Callers
 // are expected to exit only after WaitForGracefulShutdown returns to
 // ensure all servers have had time to shut down.
-func ListenAndServe(server *http.Server, gracePeriod time.Duration) {
+func ListenAndServe(server ListenAndServer, gracePeriod time.Duration) {
 	single.wg.Add(1)
 	go func() {
 		defer single.wg.Done()
@@ -159,7 +172,7 @@ func ListenAndServe(server *http.Server, gracePeriod time.Duration) {
 	go wait(shutdown(server, gracePeriod))
 }
 
-// ListenAndServe runs the HTTP server and handles shutting it down
+// ListenAndServeTLS runs the HTTP server and handles shutting it down
 // gracefully on interrupts. This function is not blocking. Callers
 // are expected to exit only after WaitForGracefulShutdown returns to
 // ensure all servers have had time to shut down.
@@ -173,8 +186,13 @@ func ListenAndServeTLS(server *http.Server, certFile, keyFile string, gracePerio
 	go wait(shutdown(server, gracePeriod))
 }
 
+// Shutdownable is typically an http.Server
+type Shutdownable interface {
+	Shutdown(context.Context) error
+}
+
 // shutdown will shut down the server
-func shutdown(server *http.Server, gracePeriod time.Duration) func() {
+func shutdown(server Shutdownable, gracePeriod time.Duration) func() {
 	return func() {
 		logrus.Info("Server shutting down...")
 		ctx, cancel := context.WithTimeout(context.Background(), gracePeriod)

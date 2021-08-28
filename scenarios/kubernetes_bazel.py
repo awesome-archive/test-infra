@@ -116,7 +116,13 @@ def echo_result(res):
 
 def get_version():
     """Return kubernetes version"""
-    with open('bazel-genfiles/version') as fp:
+    # The check for version in bazel-genfiles can be removed once everyone is
+    # off of versions before 0.25.0.
+    # https://github.com/bazelbuild/bazel/issues/8651
+    if os.path.isfile('bazel-genfiles/version'):
+        with open('bazel-genfiles/version') as fp:
+            return fp.read().strip()
+    with open('bazel-bin/version') as fp:
         return fp.read().strip()
 
 def get_changed(base, pull):
@@ -266,7 +272,7 @@ def create_parser():
         '--test-args', action="append", help='Bazel test args')
     parser.add_argument(
         '--gcs',
-        default='gs://kubernetes-release-dev/bazel',
+        default='gs://k8s-release-dev/bazel',
         help='GCS path for where to push build')
     parser.add_argument(
         '--version-suffix',

@@ -24,10 +24,14 @@ import (
 	"text/template"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
 	"github.com/sirupsen/logrus"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/diff"
+	"k8s.io/apimachinery/pkg/util/sets"
 
 	prowapi "k8s.io/test-infra/prow/apis/prowjobs/v1"
 	"k8s.io/test-infra/prow/config"
@@ -43,35 +47,47 @@ func TestPostsubmitSpec(t *testing.T) {
 		expected prowapi.ProwJobSpec
 	}{
 		{
-			name: "can override path alias and cloneuri",
+			name: "can override fields",
 			p: config.Postsubmit{
 				JobBase: config.JobBase{
 					UtilityConfig: config.UtilityConfig{
-						PathAlias: "foo",
-						CloneURI:  "bar",
+						PathAlias:      "foo",
+						CloneURI:       "bar",
+						SkipSubmodules: true,
+						CloneDepth:     7,
+						SkipFetchHead:  true,
 					},
 				},
 			},
 			expected: prowapi.ProwJobSpec{
 				Type: prowapi.PostsubmitJob,
 				Refs: &prowapi.Refs{
-					PathAlias: "foo",
-					CloneURI:  "bar",
+					PathAlias:      "foo",
+					CloneURI:       "bar",
+					SkipSubmodules: true,
+					CloneDepth:     7,
+					SkipFetchHead:  true,
 				},
 				Report: true,
 			},
 		},
 		{
-			name: "controller can default path alias and cloneuri",
+			name: "controller can default fields",
 			refs: prowapi.Refs{
-				PathAlias: "fancy",
-				CloneURI:  "cats",
+				PathAlias:      "fancy",
+				CloneURI:       "cats",
+				SkipSubmodules: true,
+				CloneDepth:     8,
+				SkipFetchHead:  true,
 			},
 			expected: prowapi.ProwJobSpec{
 				Type: prowapi.PostsubmitJob,
 				Refs: &prowapi.Refs{
-					PathAlias: "fancy",
-					CloneURI:  "cats",
+					PathAlias:      "fancy",
+					CloneURI:       "cats",
+					SkipSubmodules: true,
+					CloneDepth:     8,
+					SkipFetchHead:  true,
 				},
 				Report: true,
 			},
@@ -81,20 +97,23 @@ func TestPostsubmitSpec(t *testing.T) {
 			p: config.Postsubmit{
 				JobBase: config.JobBase{
 					UtilityConfig: config.UtilityConfig{
-						PathAlias: "foo",
-						CloneURI:  "bar",
+						PathAlias:  "foo",
+						CloneDepth: 3,
+						CloneURI:   "bar",
 					},
 				},
 			},
 			refs: prowapi.Refs{
-				PathAlias: "fancy",
-				CloneURI:  "cats",
+				PathAlias:  "fancy",
+				CloneDepth: 1,
+				CloneURI:   "cats",
 			},
 			expected: prowapi.ProwJobSpec{
 				Type: prowapi.PostsubmitJob,
 				Refs: &prowapi.Refs{
-					PathAlias: "foo",
-					CloneURI:  "bar",
+					PathAlias:  "foo",
+					CloneDepth: 3,
+					CloneURI:   "bar",
 				},
 				Report: true,
 			},
@@ -102,10 +121,12 @@ func TestPostsubmitSpec(t *testing.T) {
 	}
 
 	for _, tc := range tests {
-		actual := PostsubmitSpec(tc.p, tc.refs)
-		if expected := tc.expected; !reflect.DeepEqual(actual, expected) {
-			t.Errorf("%s: actual %#v != expected %#v", tc.name, actual, expected)
-		}
+		t.Run(tc.name, func(t *testing.T) {
+			actual := PostsubmitSpec(tc.p, tc.refs)
+			if diff := cmp.Diff(actual, tc.expected); diff != "" {
+				t.Errorf("PostsubmitSpec() got unexpected diff (-have, +want):\n%s", diff)
+			}
+		})
 	}
 }
 
@@ -176,10 +197,12 @@ func TestPresubmitSpec(t *testing.T) {
 	}
 
 	for _, tc := range tests {
-		actual := PresubmitSpec(tc.p, tc.refs)
-		if expected := tc.expected; !reflect.DeepEqual(actual, expected) {
-			t.Errorf("%s: actual %#v != expected %#v", tc.name, actual, expected)
-		}
+		t.Run(tc.name, func(t *testing.T) {
+			actual := PresubmitSpec(tc.p, tc.refs)
+			if diff := cmp.Diff(actual, tc.expected); diff != "" {
+				t.Errorf("PresubmitSpec() got unexpected diff (-have, +want):\n%s", diff)
+			}
+		})
 	}
 }
 
@@ -247,10 +270,90 @@ func TestBatchSpec(t *testing.T) {
 	}
 
 	for _, tc := range tests {
-		actual := BatchSpec(tc.p, tc.refs)
-		if expected := tc.expected; !reflect.DeepEqual(actual, expected) {
-			t.Errorf("%s: actual %#v != expected %#v", tc.name, actual, expected)
-		}
+		t.Run(tc.name, func(t *testing.T) {
+			actual := BatchSpec(tc.p, tc.refs)
+			if diff := cmp.Diff(actual, tc.expected); diff != "" {
+				t.Errorf("BatchSpec() got unexpected diff (-have, +want):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestCompletePrimaryRefs(t *testing.T) {
+	cases := []struct {
+		name     string
+		refs     prowapi.Refs
+		jobBase  config.JobBase
+		expected prowapi.Refs
+	}{
+		{
+			name: "basically works",
+		},
+		{
+			name: "use values from refs",
+			refs: prowapi.Refs{
+				PathAlias:      "this",
+				CloneURI:       "that",
+				SkipSubmodules: true,
+				CloneDepth:     1,
+				SkipFetchHead:  true,
+			},
+			expected: prowapi.Refs{
+				PathAlias:      "this",
+				CloneURI:       "that",
+				SkipSubmodules: true,
+				CloneDepth:     1,
+				SkipFetchHead:  true,
+			},
+		},
+		{
+			name: "use values from job base",
+			jobBase: config.JobBase{
+				UtilityConfig: config.UtilityConfig{
+					PathAlias:      "more",
+					CloneURI:       "fun",
+					SkipSubmodules: true,
+					CloneDepth:     2,
+					SkipFetchHead:  true,
+				},
+			},
+			expected: prowapi.Refs{
+				PathAlias:      "more",
+				CloneURI:       "fun",
+				SkipSubmodules: true,
+				CloneDepth:     2,
+				SkipFetchHead:  true,
+			},
+		},
+		{
+			name: "prefer job base values",
+			refs: prowapi.Refs{
+				PathAlias:  "this",
+				CloneURI:   "that",
+				CloneDepth: 1,
+			},
+			jobBase: config.JobBase{
+				UtilityConfig: config.UtilityConfig{
+					PathAlias:  "more",
+					CloneURI:   "fun",
+					CloneDepth: 2,
+				},
+			},
+			expected: prowapi.Refs{
+				PathAlias:  "more",
+				CloneURI:   "fun",
+				CloneDepth: 2,
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			actual := CompletePrimaryRefs(tc.refs, tc.jobBase)
+			if diff := cmp.Diff(actual, &tc.expected); diff != "" {
+				t.Errorf("CompletePrimaryRefs() got unexpected diff (-have, +want):\n%s", diff)
+			}
+		})
 	}
 }
 
@@ -258,8 +361,9 @@ func TestPartitionActive(t *testing.T) {
 	tests := []struct {
 		pjs []prowapi.ProwJob
 
-		pending   map[string]struct{}
-		triggered map[string]struct{}
+		pending   sets.String
+		triggered sets.String
+		aborted   sets.String
 	}{
 		{
 			pjs: []prowapi.ProwJob{
@@ -303,27 +407,46 @@ func TestPartitionActive(t *testing.T) {
 						State: prowapi.PendingState,
 					},
 				},
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "aborted",
+					},
+					Status: prowapi.ProwJobStatus{
+						State: prowapi.AbortedState,
+					},
+				},
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "aborted-and-completed",
+					},
+					Status: prowapi.ProwJobStatus{
+						State:          prowapi.AbortedState,
+						CompletionTime: &[]metav1.Time{metav1.Now()}[0],
+					},
+				},
 			},
-			pending: map[string]struct{}{
-				"bar": {}, "bak": {},
-			},
-			triggered: map[string]struct{}{
-				"foo": {},
-			},
+			pending:   sets.NewString("bar", "bak"),
+			triggered: sets.NewString("foo"),
+			aborted:   sets.NewString("aborted"),
 		},
 	}
 
 	for i, test := range tests {
 		t.Logf("test run #%d", i)
-		pendingCh, triggeredCh := PartitionActive(test.pjs)
+		pendingCh, triggeredCh, abortedCh := PartitionActive(test.pjs)
 		for job := range pendingCh {
-			if _, ok := test.pending[job.ObjectMeta.Name]; !ok {
+			if !test.pending.Has(job.Name) {
 				t.Errorf("didn't find pending job %#v", job)
 			}
 		}
 		for job := range triggeredCh {
-			if _, ok := test.triggered[job.ObjectMeta.Name]; !ok {
+			if !test.triggered.Has(job.Name) {
 				t.Errorf("didn't find triggered job %#v", job)
+			}
+		}
+		for job := range abortedCh {
+			if !test.aborted.Has(job.Name) {
+				t.Errorf("didn't find aborted job %#v", job)
 			}
 		}
 	}
@@ -440,24 +563,28 @@ func TestNewProwJob(t *testing.T) {
 		{
 			name: "periodic job, no extra labels",
 			spec: prowapi.ProwJobSpec{
-				Job:  "job",
-				Type: prowapi.PeriodicJob,
+				Job:     "job",
+				Context: "job-context",
+				Type:    prowapi.PeriodicJob,
 			},
 			labels: map[string]string{},
 			expectedLabels: map[string]string{
 				kube.CreatedByProw:     "true",
 				kube.ProwJobAnnotation: "job",
+				kube.ContextAnnotation: "job-context",
 				kube.ProwJobTypeLabel:  "periodic",
 			},
 			expectedAnnotations: map[string]string{
 				kube.ProwJobAnnotation: "job",
+				kube.ContextAnnotation: "job-context",
 			},
 		},
 		{
 			name: "periodic job, extra labels",
 			spec: prowapi.ProwJobSpec{
-				Job:  "job",
-				Type: prowapi.PeriodicJob,
+				Job:     "job",
+				Context: "job-context",
+				Type:    prowapi.PeriodicJob,
 			},
 			labels: map[string]string{
 				"extra": "stuff",
@@ -465,21 +592,52 @@ func TestNewProwJob(t *testing.T) {
 			expectedLabels: map[string]string{
 				kube.CreatedByProw:     "true",
 				kube.ProwJobAnnotation: "job",
+				kube.ContextAnnotation: "job-context",
 				kube.ProwJobTypeLabel:  "periodic",
 				"extra":                "stuff",
 			},
 			expectedAnnotations: map[string]string{
 				kube.ProwJobAnnotation: "job",
+				kube.ContextAnnotation: "job-context",
+			},
+		},
+		{
+			name: "periodic job with extra refs",
+			spec: prowapi.ProwJobSpec{
+				Job:     "job",
+				Context: "job-context",
+				Type:    prowapi.PeriodicJob,
+				ExtraRefs: []prowapi.Refs{{
+					Org:     "org",
+					Repo:    "repo",
+					BaseRef: "main",
+				}},
+			},
+			labels: map[string]string{},
+			expectedLabels: map[string]string{
+				kube.CreatedByProw:     "true",
+				kube.ProwJobAnnotation: "job",
+				kube.ContextAnnotation: "job-context",
+				kube.ProwJobTypeLabel:  "periodic",
+				kube.OrgLabel:          "org",
+				kube.RepoLabel:         "repo",
+				kube.BaseRefLabel:      "main",
+			},
+			expectedAnnotations: map[string]string{
+				kube.ProwJobAnnotation: "job",
+				kube.ContextAnnotation: "job-context",
 			},
 		},
 		{
 			name: "presubmit job",
 			spec: prowapi.ProwJobSpec{
-				Job:  "job",
-				Type: prowapi.PresubmitJob,
+				Job:     "job",
+				Context: "job-context",
+				Type:    prowapi.PresubmitJob,
 				Refs: &prowapi.Refs{
-					Org:  "org",
-					Repo: "repo",
+					Org:     "org",
+					Repo:    "repo",
+					BaseRef: "main",
 					Pulls: []prowapi.Pull{
 						{Number: 1},
 					},
@@ -489,23 +647,28 @@ func TestNewProwJob(t *testing.T) {
 			expectedLabels: map[string]string{
 				kube.CreatedByProw:     "true",
 				kube.ProwJobAnnotation: "job",
+				kube.ContextAnnotation: "job-context",
 				kube.ProwJobTypeLabel:  "presubmit",
 				kube.OrgLabel:          "org",
 				kube.RepoLabel:         "repo",
+				kube.BaseRefLabel:      "main",
 				kube.PullLabel:         "1",
 			},
 			expectedAnnotations: map[string]string{
 				kube.ProwJobAnnotation: "job",
+				kube.ContextAnnotation: "job-context",
 			},
 		},
 		{
 			name: "non-github presubmit job",
 			spec: prowapi.ProwJobSpec{
-				Job:  "job",
-				Type: prowapi.PresubmitJob,
+				Job:     "job",
+				Context: "job-context",
+				Type:    prowapi.PresubmitJob,
 				Refs: &prowapi.Refs{
-					Org:  "https://some-gerrit-instance.foo.com",
-					Repo: "some/invalid/repo",
+					Org:     "https://some-gerrit-instance.foo.com",
+					Repo:    "some/invalid/repo",
+					BaseRef: "main",
 					Pulls: []prowapi.Pull{
 						{Number: 1},
 					},
@@ -515,22 +678,27 @@ func TestNewProwJob(t *testing.T) {
 			expectedLabels: map[string]string{
 				kube.CreatedByProw:     "true",
 				kube.ProwJobAnnotation: "job",
+				kube.ContextAnnotation: "job-context",
 				kube.ProwJobTypeLabel:  "presubmit",
 				kube.OrgLabel:          "some-gerrit-instance.foo.com",
 				kube.RepoLabel:         "repo",
+				kube.BaseRefLabel:      "main",
 				kube.PullLabel:         "1",
 			},
 			expectedAnnotations: map[string]string{
 				kube.ProwJobAnnotation: "job",
+				kube.ContextAnnotation: "job-context",
 			},
 		}, {
 			name: "job with name too long to fit in a label",
 			spec: prowapi.ProwJobSpec{
-				Job:  "job-created-by-someone-who-loves-very-very-very-long-names-so-long-that-it-does-not-fit-into-the-Kubernetes-label-so-it-needs-to-be-truncated-to-63-characters",
-				Type: prowapi.PresubmitJob,
+				Job:     "job-created-by-someone-who-loves-very-very-very-long-names-so-long-that-it-does-not-fit-into-the-Kubernetes-label-so-it-needs-to-be-truncated-to-63-characters",
+				Context: "job-context",
+				Type:    prowapi.PresubmitJob,
 				Refs: &prowapi.Refs{
-					Org:  "org",
-					Repo: "repo",
+					Org:     "org",
+					Repo:    "repo",
+					BaseRef: "main",
 					Pulls: []prowapi.Pull{
 						{Number: 1},
 					},
@@ -540,20 +708,55 @@ func TestNewProwJob(t *testing.T) {
 			expectedLabels: map[string]string{
 				kube.CreatedByProw:     "true",
 				kube.ProwJobAnnotation: "job-created-by-someone-who-loves-very-very-very-long-names-so-l",
+				kube.ContextAnnotation: "job-context",
 				kube.ProwJobTypeLabel:  "presubmit",
 				kube.OrgLabel:          "org",
 				kube.RepoLabel:         "repo",
+				kube.BaseRefLabel:      "main",
 				kube.PullLabel:         "1",
 			},
 			expectedAnnotations: map[string]string{
+				kube.ContextAnnotation: "job-context",
 				kube.ProwJobAnnotation: "job-created-by-someone-who-loves-very-very-very-long-names-so-long-that-it-does-not-fit-into-the-Kubernetes-label-so-it-needs-to-be-truncated-to-63-characters",
+			},
+		},
+		{
+			name: "job with context too long to fit in a label",
+			spec: prowapi.ProwJobSpec{
+				Job:     "job",
+				Context: "context-created-by-someone-who-loves-very-very-very-long-names-so-long-that-it-does-not-fit-into-the-Kubernetes-label-so-it-needs-to-be-truncated-to-63-characters",
+				Type:    prowapi.PresubmitJob,
+				Refs: &prowapi.Refs{
+					Org:     "org",
+					Repo:    "repo",
+					BaseRef: "main",
+					Pulls: []prowapi.Pull{
+						{Number: 1},
+					},
+				},
+			},
+			labels: map[string]string{},
+			expectedLabels: map[string]string{
+				kube.CreatedByProw:     "true",
+				kube.ProwJobAnnotation: "job",
+				kube.ContextAnnotation: "context-created-by-someone-who-loves-very-very-very-long-names",
+				kube.ProwJobTypeLabel:  "presubmit",
+				kube.OrgLabel:          "org",
+				kube.RepoLabel:         "repo",
+				kube.BaseRefLabel:      "main",
+				kube.PullLabel:         "1",
+			},
+			expectedAnnotations: map[string]string{
+				kube.ProwJobAnnotation: "job",
+				kube.ContextAnnotation: "context-created-by-someone-who-loves-very-very-very-long-names-so-long-that-it-does-not-fit-into-the-Kubernetes-label-so-it-needs-to-be-truncated-to-63-characters",
 			},
 		},
 		{
 			name: "periodic job, extra labels, extra annotations",
 			spec: prowapi.ProwJobSpec{
-				Job:  "job",
-				Type: prowapi.PeriodicJob,
+				Job:     "job",
+				Context: "job-context",
+				Type:    prowapi.PeriodicJob,
 			},
 			labels: map[string]string{
 				"extra": "stuff",
@@ -564,12 +767,33 @@ func TestNewProwJob(t *testing.T) {
 			expectedLabels: map[string]string{
 				kube.CreatedByProw:     "true",
 				kube.ProwJobAnnotation: "job",
+				kube.ContextAnnotation: "job-context",
 				kube.ProwJobTypeLabel:  "periodic",
 				"extra":                "stuff",
 			},
 			expectedAnnotations: map[string]string{
 				kube.ProwJobAnnotation: "job",
+				kube.ContextAnnotation: "job-context",
 				"extraannotation":      "foo",
+			},
+		},
+		{
+			name: "job with podspec",
+			spec: prowapi.ProwJobSpec{
+				Job:     "job",
+				Context: "job-context",
+				Type:    prowapi.PeriodicJob,
+				PodSpec: &corev1.PodSpec{}, // Needed to catch race
+			},
+			expectedLabels: map[string]string{
+				kube.CreatedByProw:     "true",
+				kube.ProwJobAnnotation: "job",
+				kube.ContextAnnotation: "job-context",
+				kube.ProwJobTypeLabel:  "periodic",
+			},
+			expectedAnnotations: map[string]string{
+				kube.ProwJobAnnotation: "job",
+				kube.ContextAnnotation: "job-context",
 			},
 		},
 	}
@@ -584,6 +808,30 @@ func TestNewProwJob(t *testing.T) {
 		if actual, expected := pj.Annotations, testCase.expectedAnnotations; !reflect.DeepEqual(actual, expected) {
 			t.Errorf("%s: incorrect ProwJob annotations created: %s", testCase.name, diff.ObjectReflectDiff(actual, expected))
 		}
+		if pj.Spec.PodSpec != nil {
+			futzWithPodSpec := func(spec *corev1.PodSpec, val string) {
+				if spec == nil {
+					return
+				}
+				if spec.NodeSelector == nil {
+					spec.NodeSelector = map[string]string{}
+				}
+				spec.NodeSelector["foo"] = val
+				for i := range spec.Containers {
+					c := &spec.Containers[i]
+					if c.Resources.Limits == nil {
+						c.Resources.Limits = corev1.ResourceList{}
+					}
+					if c.Resources.Requests == nil {
+						c.Resources.Requests = corev1.ResourceList{}
+					}
+					c.Resources.Limits[corev1.ResourceCPU] = resource.MustParse(val)
+					c.Resources.Requests[corev1.ResourceCPU] = resource.MustParse(val)
+				}
+			}
+			go futzWithPodSpec(pj.Spec.PodSpec, "12M")
+			futzWithPodSpec(testCase.spec.PodSpec, "34M")
+		}
 	}
 }
 
@@ -597,19 +845,22 @@ func TestNewProwJobWithAnnotations(t *testing.T) {
 		{
 			name: "job without annotation",
 			spec: prowapi.ProwJobSpec{
-				Job:  "job",
-				Type: prowapi.PeriodicJob,
+				Job:     "job",
+				Context: "job-context",
+				Type:    prowapi.PeriodicJob,
 			},
 			annotations: nil,
 			expectedAnnotations: map[string]string{
 				kube.ProwJobAnnotation: "job",
+				kube.ContextAnnotation: "job-context",
 			},
 		},
 		{
 			name: "job with annotation",
 			spec: prowapi.ProwJobSpec{
-				Job:  "job",
-				Type: prowapi.PeriodicJob,
+				Job:     "job",
+				Context: "job-context",
+				Type:    prowapi.PeriodicJob,
 			},
 			annotations: map[string]string{
 				"annotation": "foo",
@@ -617,6 +868,7 @@ func TestNewProwJobWithAnnotations(t *testing.T) {
 			expectedAnnotations: map[string]string{
 				"annotation":           "foo",
 				kube.ProwJobAnnotation: "job",
+				kube.ContextAnnotation: "job-context",
 			},
 		},
 	}
@@ -634,10 +886,11 @@ func TestNewProwJobWithAnnotations(t *testing.T) {
 
 func TestJobURL(t *testing.T) {
 	var testCases = []struct {
-		name     string
-		plank    config.Plank
-		pj       prowapi.ProwJob
-		expected string
+		name        string
+		plank       config.Plank
+		pj          prowapi.ProwJob
+		expected    string
+		expectedErr string
 	}{
 		{
 			name: "non-decorated job uses template",
@@ -670,9 +923,10 @@ func TestJobURL(t *testing.T) {
 			expected: "periodic",
 		},
 		{
-			name: "decorated job with prefix uses gcslib",
+			name: "decorated job with prefix uses gcsupload",
 			plank: config.Plank{
-				JobURLPrefixConfig: map[string]string{"*": "https://gubernator.com/build"},
+				JobURLPrefixConfig:                       map[string]string{"*": "https://gubernator.com/build"},
+				JobURLPrefixDisableAppendStorageProvider: true,
 			},
 			pj: prowapi.ProwJob{Spec: prowapi.ProwJobSpec{
 				Type: prowapi.PresubmitJob,
@@ -688,13 +942,79 @@ func TestJobURL(t *testing.T) {
 			}},
 			expected: "https://gubernator.com/build/bucket/pr-logs/pull/org_repo/1",
 		},
+		{
+			name: "decorated job with prefix uses gcsupload and new bucket format with gcs (new job url format)",
+			plank: config.Plank{
+				JobURLPrefixConfig: map[string]string{"*": "https://prow.k8s.io/view/"},
+			},
+			pj: prowapi.ProwJob{Spec: prowapi.ProwJobSpec{
+				Type: prowapi.PresubmitJob,
+				Refs: &prowapi.Refs{
+					Org:   "org",
+					Repo:  "repo",
+					Pulls: []prowapi.Pull{{Number: 1}},
+				},
+				DecorationConfig: &prowapi.DecorationConfig{GCSConfiguration: &prowapi.GCSConfiguration{
+					Bucket:       "gs://bucket",
+					PathStrategy: prowapi.PathStrategyExplicit,
+				}},
+			}},
+			expected: "https://prow.k8s.io/view/gs/bucket/pr-logs/pull/org_repo/1",
+		},
+		{
+			name: "decorated job with prefix uses gcsupload and new bucket format with s3",
+			plank: config.Plank{
+				JobURLPrefixConfig: map[string]string{"*": "https://prow.k8s.io/view/"},
+			},
+			pj: prowapi.ProwJob{Spec: prowapi.ProwJobSpec{
+				Type: prowapi.PresubmitJob,
+				Refs: &prowapi.Refs{
+					Org:   "org",
+					Repo:  "repo",
+					Pulls: []prowapi.Pull{{Number: 1}},
+				},
+				DecorationConfig: &prowapi.DecorationConfig{GCSConfiguration: &prowapi.GCSConfiguration{
+					Bucket:       "s3://bucket",
+					PathStrategy: prowapi.PathStrategyExplicit,
+				}},
+			}},
+			expected: "https://prow.k8s.io/view/s3/bucket/pr-logs/pull/org_repo/1",
+		},
+		{
+			name: "decorated job with prefix uses gcsupload with valid bucket with multiple separators",
+			plank: config.Plank{
+				JobURLPrefixConfig: map[string]string{"*": "https://prow.k8s.io/view/"},
+			},
+			pj: prowapi.ProwJob{Spec: prowapi.ProwJobSpec{
+				Type: prowapi.PresubmitJob,
+				Refs: &prowapi.Refs{
+					Org:   "org",
+					Repo:  "repo",
+					Pulls: []prowapi.Pull{{Number: 1}},
+				},
+				DecorationConfig: &prowapi.DecorationConfig{GCSConfiguration: &prowapi.GCSConfiguration{
+					Bucket:       "gs://my-floppy-backup/a://doom2.wad.006",
+					PathStrategy: prowapi.PathStrategyExplicit,
+				}},
+			}},
+			expected: "https://prow.k8s.io/view/gs/my-floppy-backup/a:/doom2.wad.006/pr-logs/pull/org_repo/1",
+		},
 	}
 
 	logger := logrus.New()
 	for _, testCase := range testCases {
 		t.Run(testCase.name, func(t *testing.T) {
-			if actual, expected := JobURL(testCase.plank, testCase.pj, logger.WithField("name", testCase.name)), testCase.expected; actual != expected {
-				t.Errorf("%s: expected URL to be %q but got %q", testCase.name, expected, actual)
+			actual, actualErr := JobURL(testCase.plank, testCase.pj, logger.WithField("name", testCase.name))
+			var actualErrStr string
+			if actualErr != nil {
+				actualErrStr = actualErr.Error()
+			}
+
+			if actualErrStr != testCase.expectedErr {
+				t.Errorf("%s: expectedErr = %v, but got %v", testCase.name, testCase.expectedErr, actualErrStr)
+			}
+			if actual != testCase.expected {
+				t.Errorf("%s: expected URL to be %q but got %q", testCase.name, testCase.expected, actual)
 			}
 		})
 	}
@@ -703,6 +1023,7 @@ func TestJobURL(t *testing.T) {
 func TestCreateRefs(t *testing.T) {
 	pr := github.PullRequest{
 		Number:  42,
+		Title:   "hello world",
 		HTMLURL: "https://github.example.com/kubernetes/Hello-World/pull/42",
 		Head: github.PullRequestBranch{
 			SHA: "123456",
@@ -734,6 +1055,7 @@ func TestCreateRefs(t *testing.T) {
 				Number:     42,
 				Author:     "ibzib",
 				SHA:        "123456",
+				Title:      "hello world",
 				Link:       "https://github.example.com/kubernetes/Hello-World/pull/42",
 				AuthorLink: "https://github.example.com/ibzib",
 				CommitLink: "https://github.example.com/kubernetes/Hello-World/pull/42/commits/123456",
@@ -748,10 +1070,12 @@ func TestCreateRefs(t *testing.T) {
 func TestSpecFromJobBase(t *testing.T) {
 	permittedGroups := []int{1234, 5678}
 	permittedUsers := []string{"authorized_user", "another_authorized_user"}
+	permittedOrgs := []string{"kubernetes", "kubernetes-sigs"}
 	rerunAuthConfig := prowapi.RerunAuthConfig{
 		AllowAnyone:   false,
 		GitHubTeamIDs: permittedGroups,
 		GitHubUsers:   permittedUsers,
+		GitHubOrgs:    permittedOrgs,
 	}
 	testCases := []struct {
 		name    string
@@ -796,6 +1120,9 @@ func TestSpecFromJobBase(t *testing.T) {
 				if pj.RerunAuthConfig.GitHubUsers == nil {
 					return errors.New("Expected RerunAuthConfig.GitHubUsers to be non-nil")
 				}
+				if pj.RerunAuthConfig.GitHubOrgs == nil {
+					return errors.New("Expected RerunAuthConfig.GitHubOrgs to be non-nil")
+				}
 				return nil
 			},
 		},
@@ -820,5 +1147,30 @@ func TestSpecFromJobBase(t *testing.T) {
 				t.Fatalf("Verification failed: %v", err)
 			}
 		})
+	}
+}
+
+func TestPeriodicSpec(t *testing.T) {
+	testCases := []struct {
+		name   string
+		config config.Periodic
+		verify func(prowapi.ProwJobSpec) error
+	}{
+		{
+			name:   "Report gets set to true",
+			config: config.Periodic{},
+			verify: func(p prowapi.ProwJobSpec) error {
+				if !p.Report {
+					return errors.New("report is not true")
+				}
+				return nil
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		if err := tc.verify(PeriodicSpec(tc.config)); err != nil {
+			t.Error(err)
+		}
 	}
 }

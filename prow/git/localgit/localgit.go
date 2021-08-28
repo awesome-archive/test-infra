@@ -27,7 +27,20 @@ import (
 	"strings"
 
 	"k8s.io/test-infra/prow/git"
+	v2 "k8s.io/test-infra/prow/git/v2"
 )
+
+type Clients func() (*LocalGit, v2.ClientFactory, error)
+
+func DefaultBranch(dir string) string {
+	cmd := exec.Command("git", "config", "init.defaultBranch")
+	cmd.Dir = dir
+	out, err := cmd.Output()
+	if err != nil {
+		return "master"
+	}
+	return strings.TrimSpace(string(out))
+}
 
 // LocalGit stores the repos in a temp dir. Create with New and delete with
 // Clean.
@@ -36,10 +49,12 @@ type LocalGit struct {
 	Dir string
 	// Git is the location of the git binary.
 	Git string
+	// InitialBranch is sent to git init
+	InitialBranch string
 }
 
-// New creates a LocalGit and a git.Client pointing at it.
-func New() (*LocalGit, *git.Client, error) {
+// New creates a LocalGit and a client factory from a git.Client pointing at it.
+func New() (*LocalGit, v2.ClientFactory, error) {
 	g, err := exec.LookPath("git")
 	if err != nil {
 		return nil, nil, err
@@ -54,8 +69,8 @@ func New() (*LocalGit, *git.Client, error) {
 		return nil, nil, err
 	}
 
-	getSecret := func() []byte {
-		return []byte("")
+	getSecret := func(_ string) (string, error) {
+		return "", nil
 	}
 
 	c.SetCredentials("", getSecret)
@@ -64,7 +79,7 @@ func New() (*LocalGit, *git.Client, error) {
 	return &LocalGit{
 		Dir: t,
 		Git: g,
-	}, c, nil
+	}, v2.ClientFactoryFrom(c), nil
 }
 
 // Clean deletes the local git dir.
@@ -98,7 +113,11 @@ func (lg *LocalGit) MakeFakeRepo(org, repo string) error {
 		return err
 	}
 
-	if err := runCmd(lg.Git, rdir, "init"); err != nil {
+	initArgs := []string{"init"}
+	if lg.InitialBranch != "" {
+		initArgs = append(initArgs, "--initial-branch", lg.InitialBranch)
+	}
+	if err := runCmd(lg.Git, rdir, initArgs...); err != nil {
 		return err
 	}
 	if err := runCmd(lg.Git, rdir, "config", "user.email", "test@test.test"); err != nil {
@@ -174,4 +193,26 @@ func (lg *LocalGit) Merge(org, repo, commitlike string) (string, error) {
 func (lg *LocalGit) Rebase(org, repo, commitlike string) (string, error) {
 	rdir := filepath.Join(lg.Dir, org, repo)
 	return runCmdOutput(lg.Git, rdir, "rebase", commitlike)
+}
+
+// NewV2 creates a LocalGit and a v2 client factory pointing at it.
+func NewV2() (*LocalGit, v2.ClientFactory, error) {
+	g, err := exec.LookPath("git")
+	if err != nil {
+		return nil, nil, err
+	}
+	t, err := ioutil.TempDir("", "localgit")
+	if err != nil {
+		return nil, nil, err
+	}
+	c, err := v2.NewLocalClientFactory(t,
+		func() (name, email string, err error) { return "robot", "robot@beep.boop", nil },
+		func(content []byte) []byte { return content })
+	if err != nil {
+		return nil, nil, err
+	}
+	return &LocalGit{
+		Dir: t,
+		Git: g,
+	}, c, nil
 }

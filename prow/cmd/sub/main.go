@@ -25,16 +25,20 @@ import (
 	"time"
 
 	"github.com/sirupsen/logrus"
-	"k8s.io/test-infra/prow/interrupts"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	prowapi "k8s.io/test-infra/prow/apis/prowjobs/v1"
 	prowv1 "k8s.io/test-infra/prow/client/clientset/versioned/typed/prowjobs/v1"
 	"k8s.io/test-infra/prow/config"
 	"k8s.io/test-infra/prow/config/secret"
+	"k8s.io/test-infra/prow/crier/reporters/pubsub"
 	"k8s.io/test-infra/prow/flagutil"
+	configflagutil "k8s.io/test-infra/prow/flagutil/config"
+	"k8s.io/test-infra/prow/git/v2"
+	"k8s.io/test-infra/prow/interrupts"
 	"k8s.io/test-infra/prow/logrusutil"
 	"k8s.io/test-infra/prow/metrics"
-	"k8s.io/test-infra/prow/pubsub/reporter"
+	"k8s.io/test-infra/prow/pjutil/pprof"
 	"k8s.io/test-infra/prow/pubsub/subscriber"
 )
 
@@ -44,15 +48,16 @@ var (
 
 type options struct {
 	client         flagutil.KubernetesOptions
+	github         flagutil.GitHubOptions
 	port           int
 	pushSecretFile string
 
-	configPath    string
-	jobConfigPath string
-	pluginConfig  string
+	config       configflagutil.ConfigOptions
+	pluginConfig string
 
-	dryRun      bool
-	gracePeriod time.Duration
+	dryRun                 bool
+	gracePeriod            time.Duration
+	instrumentationOptions flagutil.InstrumentationOptions
 }
 
 type kubeClient struct {
@@ -60,49 +65,58 @@ type kubeClient struct {
 	dryRun bool
 }
 
-func (c *kubeClient) Create(job *prowapi.ProwJob) (*prowapi.ProwJob, error) {
+func (c *kubeClient) Create(ctx context.Context, job *prowapi.ProwJob, o metav1.CreateOptions) (*prowapi.ProwJob, error) {
 	if c.dryRun {
 		return job, nil
 	}
-	return c.client.Create(job)
+	return c.client.Create(ctx, job, o)
 }
 
 func init() {
-	flagOptions = &options{}
+	flagOptions = &options{config: configflagutil.ConfigOptions{ConfigPath: "/etc/config/config.yaml"}}
 	fs := flag.NewFlagSet(os.Args[0], flag.ExitOnError)
 
 	fs.IntVar(&flagOptions.port, "port", 80, "HTTP Port.")
 	fs.StringVar(&flagOptions.pushSecretFile, "push-secret-file", "", "Path to Pub/Sub Push secret file.")
 
-	fs.StringVar(&flagOptions.configPath, "config-path", "/etc/config/config.yaml", "Path to config.yaml.")
-	fs.StringVar(&flagOptions.jobConfigPath, "job-config-path", "", "Path to prow job configs.")
-
 	fs.BoolVar(&flagOptions.dryRun, "dry-run", true, "Dry run for testing. Uses API tokens but does not mutate.")
 	fs.DurationVar(&flagOptions.gracePeriod, "grace-period", 180*time.Second, "On shutdown, try to handle remaining events for the specified duration. ")
 
+	flagOptions.config.AddFlags(fs)
 	flagOptions.client.AddFlags(fs)
+	flagOptions.github.AddFlags(fs)
+	flagOptions.instrumentationOptions.AddFlags(fs)
 
 	fs.Parse(os.Args[1:])
 }
 
 func main() {
-	logrusutil.ComponentInit("pubsub-subscriber")
+	logrusutil.ComponentInit()
 
-	configAgent := &config.Agent{}
-	if err := configAgent.Start(flagOptions.configPath, flagOptions.jobConfigPath); err != nil {
+	configAgent, err := flagOptions.config.ConfigAgent()
+	if err != nil {
 		logrus.WithError(err).Fatal("Error starting config agent.")
 	}
 
-	var tokenGenerator func() []byte
+	var tokens []string
 	if flagOptions.pushSecretFile != "" {
-		var tokens []string
 		tokens = append(tokens, flagOptions.pushSecretFile)
+	}
+	if flagOptions.github.TokenPath != "" {
+		tokens = append(tokens, flagOptions.github.TokenPath)
+	}
+	if err := secret.Add(tokens...); err != nil {
+		logrus.WithError(err).Fatal("failed to start secret agent")
+	}
+	tokenGenerator := secret.GetTokenGenerator(flagOptions.pushSecretFile)
 
-		secretAgent := &secret.Agent{}
-		if err := secretAgent.Start(tokens); err != nil {
-			logrus.WithError(err).Fatal("Error starting secrets agent.")
+	var gitClientFactory git.ClientFactory
+	if flagOptions.github.TokenPath != "" {
+		gitClient, err := flagOptions.github.GitClient(flagOptions.dryRun)
+		if err != nil {
+			logrus.WithError(err).Fatal("Error getting Git client.")
 		}
-		tokenGenerator = secretAgent.GetTokenGenerator(flagOptions.pushSecretFile)
+		gitClientFactory = git.ClientFactoryFrom(gitClient)
 	}
 
 	prowjobClient, err := flagOptions.client.ProwJobClient(configAgent.Config().ProwJobNamespace, flagOptions.dryRun)
@@ -118,14 +132,16 @@ func main() {
 
 	defer interrupts.WaitForGracefulShutdown()
 
-	// Expose prometheus metrics
-	metrics.ExposeMetrics("sub", configAgent.Config().PushGateway)
+	// Expose prometheus and pprof metrics
+	metrics.ExposeMetrics("sub", configAgent.Config().PushGateway, flagOptions.instrumentationOptions.MetricsPort)
+	pprof.Instrument(flagOptions.instrumentationOptions)
 
 	s := &subscriber.Subscriber{
 		ConfigAgent:   configAgent,
 		Metrics:       promMetrics,
 		ProwJobClient: kubeClient,
-		Reporter:      reporter.NewReporter(configAgent.Config),
+		GitClient:     config.NewInRepoConfigGitCache(gitClientFactory),
+		Reporter:      pubsub.NewReporter(configAgent.Config), // reuse crier reporter
 	}
 
 	// Return 200 on / for health checks.

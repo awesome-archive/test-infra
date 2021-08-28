@@ -50,7 +50,7 @@ func NewProwJob(spec prowapi.ProwJobSpec, extraLabels, extraAnnotations map[stri
 			Labels:      labels,
 			Annotations: annotations,
 		},
-		Spec: spec,
+		Spec: *spec.DeepCopy(),
 		Status: prowapi.ProwJobStatus{
 			StartTime: metav1.Now(),
 			State:     prowapi.TriggeredState,
@@ -75,6 +75,7 @@ func createRefs(pr github.PullRequest, baseSHA string) prowapi.Refs {
 				Number:     number,
 				Author:     pr.User.Login,
 				SHA:        pr.Head.SHA,
+				Title:      pr.Title,
 				Link:       pr.HTMLURL,
 				AuthorLink: pr.User.HTMLURL,
 				CommitLink: fmt.Sprintf("%s/pull/%d/commits/%s", repoLink, number, pr.Head.SHA),
@@ -112,7 +113,7 @@ func PresubmitSpec(p config.Presubmit, refs prowapi.Refs) prowapi.ProwJobSpec {
 			GitHubBranchSourceJob: p.JenkinsSpec.GitHubBranchSourceJob,
 		}
 	}
-	pjs.Refs = completePrimaryRefs(refs, p.JobBase)
+	pjs.Refs = CompletePrimaryRefs(refs, p.JobBase)
 
 	return pjs
 }
@@ -123,7 +124,7 @@ func PostsubmitSpec(p config.Postsubmit, refs prowapi.Refs) prowapi.ProwJobSpec 
 	pjs.Type = prowapi.PostsubmitJob
 	pjs.Context = p.Context
 	pjs.Report = !p.SkipReport
-	pjs.Refs = completePrimaryRefs(refs, p.JobBase)
+	pjs.Refs = CompletePrimaryRefs(refs, p.JobBase)
 	if p.JenkinsSpec != nil {
 		pjs.JenkinsSpec = &prowapi.JenkinsSpec{
 			GitHubBranchSourceJob: p.JenkinsSpec.GitHubBranchSourceJob,
@@ -136,6 +137,8 @@ func PostsubmitSpec(p config.Postsubmit, refs prowapi.Refs) prowapi.ProwJobSpec 
 // PeriodicSpec initializes a ProwJobSpec for a given periodic job.
 func PeriodicSpec(p config.Periodic) prowapi.ProwJobSpec {
 	pjs := specFromJobBase(p.JobBase)
+	// It is currently not possible to disable reporting for individual periodics.
+	pjs.Report = true
 	pjs.Type = prowapi.PeriodicJob
 
 	return pjs
@@ -146,7 +149,7 @@ func BatchSpec(p config.Presubmit, refs prowapi.Refs) prowapi.ProwJobSpec {
 	pjs := specFromJobBase(p.JobBase)
 	pjs.Type = prowapi.BatchJob
 	pjs.Context = p.Context
-	pjs.Refs = completePrimaryRefs(refs, p.JobBase)
+	pjs.Refs = CompletePrimaryRefs(refs, p.JobBase)
 
 	return pjs
 }
@@ -155,10 +158,6 @@ func specFromJobBase(jb config.JobBase) prowapi.ProwJobSpec {
 	var namespace string
 	if jb.Namespace != nil {
 		namespace = *jb.Namespace
-	}
-	var rerunAuthConfig prowapi.RerunAuthConfig
-	if jb.RerunAuthConfig != nil {
-		rerunAuthConfig = *jb.RerunAuthConfig
 	}
 	return prowapi.ProwJobSpec{
 		Job:             jb.Name,
@@ -172,24 +171,30 @@ func specFromJobBase(jb config.JobBase) prowapi.ProwJobSpec {
 		DecorationConfig: jb.DecorationConfig,
 
 		PodSpec:         jb.Spec,
-		BuildSpec:       jb.BuildSpec,
 		PipelineRunSpec: jb.PipelineRunSpec,
 
 		ReporterConfig:  jb.ReporterConfig,
-		RerunAuthConfig: rerunAuthConfig,
+		RerunAuthConfig: jb.RerunAuthConfig,
 		Hidden:          jb.Hidden,
 	}
 }
 
-func completePrimaryRefs(refs prowapi.Refs, jb config.JobBase) *prowapi.Refs {
+func CompletePrimaryRefs(refs prowapi.Refs, jb config.JobBase) *prowapi.Refs {
 	if jb.PathAlias != "" {
 		refs.PathAlias = jb.PathAlias
 	}
 	if jb.CloneURI != "" {
 		refs.CloneURI = jb.CloneURI
 	}
-	refs.SkipSubmodules = jb.SkipSubmodules
-	refs.CloneDepth = jb.CloneDepth
+	if jb.SkipSubmodules {
+		refs.SkipSubmodules = jb.SkipSubmodules
+	}
+	if jb.CloneDepth > 0 {
+		refs.CloneDepth = jb.CloneDepth
+	}
+	if jb.SkipFetchHead {
+		refs.SkipFetchHead = jb.SkipFetchHead
+	}
 	return &refs
 }
 
@@ -198,19 +203,22 @@ func completePrimaryRefs(refs prowapi.Refs, jb config.JobBase) *prowapi.Refs {
 // by different goroutines. Complete prowjobs are filtered out. Controller
 // loops need to handle pending jobs first so they can conform to maximum
 // concurrency requirements that different jobs may have.
-func PartitionActive(pjs []prowapi.ProwJob) (pending, triggered chan prowapi.ProwJob) {
+func PartitionActive(pjs []prowapi.ProwJob) (pending, triggered, aborted chan prowapi.ProwJob) {
 	// Size channels correctly.
-	pendingCount, triggeredCount := 0, 0
+	pendingCount, triggeredCount, abortedCount := 0, 0, 0
 	for _, pj := range pjs {
 		switch pj.Status.State {
 		case prowapi.PendingState:
 			pendingCount++
 		case prowapi.TriggeredState:
 			triggeredCount++
+		case prowapi.AbortedState:
+			abortedCount++
 		}
 	}
 	pending = make(chan prowapi.ProwJob, pendingCount)
 	triggered = make(chan prowapi.ProwJob, triggeredCount)
+	aborted = make(chan prowapi.ProwJob, abortedCount)
 
 	// Partition the jobs into the two separate channels.
 	for _, pj := range pjs {
@@ -219,11 +227,16 @@ func PartitionActive(pjs []prowapi.ProwJob) (pending, triggered chan prowapi.Pro
 			pending <- pj
 		case prowapi.TriggeredState:
 			triggered <- pj
+		case prowapi.AbortedState:
+			if !pj.Complete() {
+				aborted <- pj
+			}
 		}
 	}
 	close(pending)
 	close(triggered)
-	return pending, triggered
+	close(aborted)
+	return pending, triggered, aborted
 }
 
 // GetLatestProwJobs filters through the provided prowjobs and returns
@@ -266,23 +279,36 @@ func ProwJobFields(pj *prowapi.ProwJob) logrus.Fields {
 // JobURL returns the expected URL for ProwJobStatus.
 //
 // TODO(fejta): consider moving default JobURLTemplate and JobURLPrefix out of plank
-func JobURL(plank config.Plank, pj prowapi.ProwJob, log *logrus.Entry) string {
-	if pj.Spec.DecorationConfig != nil && plank.GetJobURLPrefix(pj.Spec.Refs) != "" {
+func JobURL(plank config.Plank, pj prowapi.ProwJob, log *logrus.Entry) (string, error) {
+	if pj.Spec.DecorationConfig != nil && plank.GetJobURLPrefix(&pj) != "" {
 		spec := downwardapi.NewJobSpec(pj.Spec, pj.Status.BuildID, pj.Name)
 		gcsConfig := pj.Spec.DecorationConfig.GCSConfiguration
 		_, gcsPath, _ := gcsupload.PathsForJob(gcsConfig, &spec, "")
 
-		prefix, _ := url.Parse(plank.GetJobURLPrefix(pj.Spec.Refs))
-		prefix.Path = path.Join(prefix.Path, gcsConfig.Bucket, gcsPath)
-		return prefix.String()
+		prefix, _ := url.Parse(plank.GetJobURLPrefix(&pj))
+
+		prowPath, err := prowapi.ParsePath(gcsConfig.Bucket)
+		if err != nil {
+			return "", fmt.Errorf("calculating joburl: %w", err)
+		}
+
+		// Final path will be, e.g.:
+		// prefix.Scheme + prefix.Host + prefix.Path + storageProvider + bucketName         + gcsPath
+		// https://prow.k8s.io/view/                 + gs/             + kubernetes-jenkins + pr-logs/pull/kubernetes-sigs_cluster-api-provider-openstack/541/pull-cluster-api-provider-openstack-test/1247344427123347459
+		if plank.JobURLPrefixDisableAppendStorageProvider {
+			prefix.Path = path.Join(prefix.Path, prowPath.FullPath(), gcsPath)
+		} else {
+			prefix.Path = path.Join(prefix.Path, prowPath.StorageProvider(), prowPath.FullPath(), gcsPath)
+		}
+		return prefix.String(), nil
 	}
 	var b bytes.Buffer
 	if err := plank.JobURLTemplate.Execute(&b, &pj); err != nil {
 		log.WithFields(ProwJobFields(&pj)).Errorf("error executing URL template: %v", err)
 	} else {
-		return b.String()
+		return b.String(), nil
 	}
-	return ""
+	return "", nil
 }
 
 // ClusterToCtx converts the prow job's cluster to a cluster context

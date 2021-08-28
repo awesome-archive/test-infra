@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Copyright 2019 The Kubernetes Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,8 +17,10 @@ set -o errexit
 set -o nounset
 set -o pipefail
 
-echo "Activating service account..."
-gcloud auth activate-service-account --key-file="${GOOGLE_APPLICATION_CREDENTIALS}"
+if [[ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]];then
+  echo "Activating service account..."
+  gcloud auth activate-service-account --key-file="${GOOGLE_APPLICATION_CREDENTIALS}"
+fi
 
 echo "Executing builder, sending logs to ${ARTIFACTS}..."
 bazel run //images/builder -- --log-dir="${ARTIFACTS}" "$@"

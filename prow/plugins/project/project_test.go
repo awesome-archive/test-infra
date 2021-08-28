@@ -104,17 +104,6 @@ func TestProjectCommand(t *testing.T) {
 		},
 	}
 
-	fakeClient := &fakegithub.FakeClient{
-		RepoProjects:      repoProjects,
-		ProjectColumnsMap: projectColumnsMap,
-		ColumnIDMap:       columnIDMap,
-		IssueComments:     make(map[int][]github.IssueComment),
-	}
-	botName, err := fakeClient.BotName()
-	if err != nil {
-		t.Errorf(err.Error())
-	}
-
 	type testCase struct {
 		name            string
 		action          github.GenericCommentEventAction
@@ -288,7 +277,7 @@ func TestProjectCommand(t *testing.T) {
 			body:            "/project 0.0.0 To do",
 			repo:            "kubernetes",
 			org:             "kubernetes",
-			commenter:       botName,
+			commenter:       fakegithub.Bot,
 			previousProject: "",
 			previousColumn:  "",
 			expectedProject: "",
@@ -310,10 +299,17 @@ func TestProjectCommand(t *testing.T) {
 		},
 	}
 
+	fakeClient := fakegithub.NewFakeClient()
+	fakeClient.RepoProjects = repoProjects
+	fakeClient.ProjectColumnsMap = projectColumnsMap
+	fakeClient.ColumnIDMap = columnIDMap
+
 	prevCommentCount := 0
 	for _, tc := range testcases {
+		tc := tc
 		fakeClient.Project = tc.previousProject
 		fakeClient.Column = tc.previousColumn
+		fakeClient.ColumnCardsMap = map[int][]github.ProjectCard{}
 
 		e := &github.GenericCommentEvent{
 			Action:       tc.action,
@@ -381,6 +377,13 @@ func TestParseCommand(t *testing.T) {
 		},
 		{
 			hasMatches:      true,
+			command:         "/project clear 0.0.0 Backlog",
+			proposedProject: "0.0.0",
+			proposedColumn:  "Backlog",
+			shouldClear:     true,
+		},
+		{
+			hasMatches:      true,
 			command:         "/project clear",
 			proposedProject: "",
 			proposedColumn:  "",
@@ -392,6 +395,55 @@ func TestParseCommand(t *testing.T) {
 			proposedProject: "0.0.0",
 			proposedColumn:  "",
 			shouldClear:     false,
+		},
+		{
+			hasMatches:      true,
+			command:         "/project '0.0.0'",
+			proposedProject: "0.0.0",
+			proposedColumn:  "",
+			shouldClear:     false,
+		},
+		{
+			hasMatches:      true,
+			command:         "/project \"0.0.0\"",
+			proposedProject: "0.0.0",
+			proposedColumn:  "",
+			shouldClear:     false,
+		},
+		{
+			hasMatches:      true,
+			command:         "/project '0.0.0' To do",
+			proposedProject: "0.0.0",
+			proposedColumn:  "To do",
+			shouldClear:     false,
+		},
+		{
+			hasMatches:      true,
+			command:         "/project '0.0.0' \"To do\"",
+			proposedProject: "0.0.0",
+			proposedColumn:  "To do",
+			shouldClear:     false,
+		},
+		{
+			hasMatches:      true,
+			command:         "/project 'something 0.0.0' \"To do\"",
+			proposedProject: "something 0.0.0",
+			proposedColumn:  "To do",
+			shouldClear:     false,
+		},
+		{
+			hasMatches:      true,
+			command:         "/project clear '0.0.0' \"To do\"",
+			proposedProject: "0.0.0",
+			proposedColumn:  "To do",
+			shouldClear:     true,
+		},
+		{
+			hasMatches:      true,
+			command:         "/project clear 'something 0.0.0' \"To do\"",
+			proposedProject: "something 0.0.0",
+			proposedColumn:  "To do",
+			shouldClear:     true,
 		},
 		{
 			hasMatches:      false,
@@ -414,7 +466,7 @@ func TestParseCommand(t *testing.T) {
 			}
 			continue
 		}
-		proposedProject, proposedColumn, shouldClear, _ := processRegexMatches(matches)
+		proposedProject, proposedColumn, shouldClear, _ := processCommand(matches[1])
 		if proposedProject != test.proposedProject ||
 			proposedColumn != test.proposedColumn ||
 			shouldClear != test.shouldClear {

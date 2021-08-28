@@ -1,4 +1,4 @@
-load("@py_deps//:requirements.bzl", "requirement")
+load("@py3_deps//:requirements.bzl", "requirement")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -39,7 +39,6 @@ py_binary(
         requirement("certifi"),
         requirement("chardet"),
         requirement("idna"),
-        requirement("influxdb"),
         requirement("python-dateutil"),
         requirement("pytz"),
         requirement("ruamel.yaml"),

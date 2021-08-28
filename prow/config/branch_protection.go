@@ -19,14 +19,21 @@ package config
 import (
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/sirupsen/logrus"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
+	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/apimachinery/pkg/util/sets"
 )
 
 // Policy for the config/org/repo/branch.
 // When merging policies, a nil value results in inheriting the parent policy.
 type Policy struct {
+	// Unmanaged makes us not manage the branchprotection.
+	// Careful: Contrary to all other settings, this can _not_ be overridden
+	// on a lower level and is always inherited.
+	Unmanaged *bool `json:"unmanaged,omitempty"`
 	// Protect overrides whether branch protection is enabled if set.
 	Protect *bool `json:"protect,omitempty"`
 	// RequiredStatusChecks configures github contexts
@@ -37,13 +44,23 @@ type Policy struct {
 	Restrictions *Restrictions `json:"restrictions,omitempty"`
 	// RequiredPullRequestReviews specifies github approval/review criteria.
 	RequiredPullRequestReviews *ReviewPolicy `json:"required_pull_request_reviews,omitempty"`
+	// RequiredLinearHistory enforces a linear commit Git history, which prevents anyone from pushing merge commits to a branch.
+	RequiredLinearHistory *bool `json:"required_linear_history,omitempty"`
+	// AllowForcePushes permits force pushes to the protected branch by anyone with write access to the repository.
+	AllowForcePushes *bool `json:"allow_force_pushes,omitempty"`
+	// AllowDeletions allows deletion of the protected branch by anyone with write access to the repository.
+	AllowDeletions *bool `json:"allow_deletions,omitempty"`
 	// Exclude specifies a set of regular expressions which identify branches
-	// that should be excluded from the protection policy
+	// that should be excluded from the protection policy, mutually exclusive with Include
 	Exclude []string `json:"exclude,omitempty"`
+	// Include specifies a set of regular expressions which identify branches
+	// that should be included from the protection policy, mutually exclusive with Exclude
+	Include []string `json:"include,omitempty"`
 }
 
 func (p Policy) defined() bool {
-	return p.Protect != nil || p.RequiredStatusChecks != nil || p.Admins != nil || p.Restrictions != nil || p.RequiredPullRequestReviews != nil
+	return p.Protect != nil || p.RequiredStatusChecks != nil || p.Admins != nil || p.Restrictions != nil || p.RequiredPullRequestReviews != nil ||
+		p.RequiredLinearHistory != nil || p.AllowForcePushes != nil || p.AllowDeletions != nil
 }
 
 // ContextPolicy configures required github contexts.
@@ -73,8 +90,8 @@ type ReviewPolicy struct {
 // Restrictions limits who can merge
 // Users and Teams items are appended to parent lists.
 type Restrictions struct {
-	Users []string `json:"users"`
-	Teams []string `json:"teams"`
+	Users []string `json:"users,omitempty"`
+	Teams []string `json:"teams,omitempty"`
 }
 
 // selectInt returns the child if set, else parent
@@ -150,30 +167,116 @@ func mergeRestrictions(parent, child *Restrictions) *Restrictions {
 // Apply returns a policy that merges the child into the parent
 func (p Policy) Apply(child Policy) Policy {
 	return Policy{
+		Unmanaged:                  selectBool(p.Unmanaged, child.Unmanaged),
 		Protect:                    selectBool(p.Protect, child.Protect),
 		RequiredStatusChecks:       mergeContextPolicy(p.RequiredStatusChecks, child.RequiredStatusChecks),
 		Admins:                     selectBool(p.Admins, child.Admins),
+		RequiredLinearHistory:      selectBool(p.RequiredLinearHistory, child.RequiredLinearHistory),
+		AllowForcePushes:           selectBool(p.AllowForcePushes, child.AllowForcePushes),
+		AllowDeletions:             selectBool(p.AllowDeletions, child.AllowDeletions),
 		Restrictions:               mergeRestrictions(p.Restrictions, child.Restrictions),
 		RequiredPullRequestReviews: mergeReviewPolicy(p.RequiredPullRequestReviews, child.RequiredPullRequestReviews),
 		Exclude:                    unionStrings(p.Exclude, child.Exclude),
+		Include:                    unionStrings(p.Include, child.Include),
 	}
 }
 
 // BranchProtection specifies the global branch protection policy
 type BranchProtection struct {
-	Policy
+	Policy `json:",inline"`
 	// ProtectTested determines if branch protection rules are set for all repos
 	// that Prow has registered jobs for, regardless of if those repos are in the
 	// branch protection config.
-	ProtectTested bool `json:"protect-tested-repos,omitempty"`
+	ProtectTested *bool `json:"protect-tested-repos,omitempty"`
 	// Orgs holds branch protection options for orgs by name
 	Orgs map[string]Org `json:"orgs,omitempty"`
 	// AllowDisabledPolicies allows a child to disable all protection even if the
 	// branch has inherited protection options from a parent.
-	AllowDisabledPolicies bool `json:"allow_disabled_policies,omitempty"`
+	AllowDisabledPolicies *bool `json:"allow_disabled_policies,omitempty"`
 	// AllowDisabledJobPolicies allows a branch to choose to opt out of branch protection
 	// even if Prow has registered required jobs for that branch.
-	AllowDisabledJobPolicies bool `json:"allow_disabled_job_policies,omitempty"`
+	AllowDisabledJobPolicies *bool `json:"allow_disabled_job_policies,omitempty"`
+	// ProtectReposWithOptionalJobs will make the Branchprotector manage required status
+	// contexts on repositories that only have optional jobs (default: false)
+	ProtectReposWithOptionalJobs *bool `json:"protect_repos_with_optional_jobs,omitempty"`
+}
+
+func isPolicySet(p Policy) bool {
+	return !apiequality.Semantic.DeepEqual(p, Policy{})
+}
+
+func (bp *BranchProtection) merge(additional *BranchProtection) error {
+	var errs []error
+	if isPolicySet(bp.Policy) && isPolicySet(additional.Policy) {
+		errs = append(errs, errors.New("both brachprotection configs set a top-level policy"))
+	} else if isPolicySet(additional.Policy) {
+		bp.Policy = additional.Policy
+	}
+	if bp.ProtectTested != nil && additional.ProtectTested != nil {
+		errs = append(errs, errors.New("both branchprotection configs set protect-tested-repos"))
+	} else if additional.ProtectTested != nil {
+		bp.ProtectTested = additional.ProtectTested
+	}
+	if bp.AllowDisabledPolicies != nil && additional.AllowDisabledPolicies != nil {
+		errs = append(errs, errors.New("both branchprotection configs set allow_disabled_policies"))
+	} else if additional.AllowDisabledPolicies != nil {
+		bp.AllowDisabledPolicies = additional.AllowDisabledPolicies
+	}
+	if bp.AllowDisabledJobPolicies != nil && additional.AllowDisabledJobPolicies != nil {
+		errs = append(errs, errors.New("both branchprotection configs set allow_disabled_job_policies"))
+	} else if additional.AllowDisabledJobPolicies != nil {
+		bp.AllowDisabledJobPolicies = additional.AllowDisabledJobPolicies
+	}
+	if bp.ProtectReposWithOptionalJobs != nil && additional.ProtectReposWithOptionalJobs != nil {
+		errs = append(errs, errors.New("both branchprotection configs set protect_repos_with_optional_jobs"))
+	} else if additional.ProtectReposWithOptionalJobs != nil {
+		bp.ProtectReposWithOptionalJobs = additional.ProtectReposWithOptionalJobs
+	}
+	for org := range additional.Orgs {
+		if bp.Orgs == nil {
+			bp.Orgs = map[string]Org{}
+		}
+		if isPolicySet(bp.Orgs[org].Policy) && isPolicySet(additional.Orgs[org].Policy) {
+			errs = append(errs, fmt.Errorf("both branchprotection configs define a policy for org %s", org))
+		} else if _, ok := additional.Orgs[org]; ok && !isPolicySet(bp.Orgs[org].Policy) {
+			orgSettings := bp.Orgs[org]
+			orgSettings.Policy = additional.Orgs[org].Policy
+			bp.Orgs[org] = orgSettings
+		}
+
+		for repo := range additional.Orgs[org].Repos {
+			if bp.Orgs[org].Repos == nil {
+				orgSettings := bp.Orgs[org]
+				orgSettings.Repos = map[string]Repo{}
+				bp.Orgs[org] = orgSettings
+			}
+			if isPolicySet(bp.Orgs[org].Repos[repo].Policy) && isPolicySet(additional.Orgs[org].Repos[repo].Policy) {
+				errs = append(errs, fmt.Errorf("both branchprotection configs define a policy for repo %s/%s", org, repo))
+			} else if _, ok := additional.Orgs[org].Repos[repo]; ok && !isPolicySet(bp.Orgs[org].Repos[repo].Policy) {
+				repoSettings := bp.Orgs[org].Repos[repo]
+				repoSettings.Policy = additional.Orgs[org].Repos[repo].Policy
+				bp.Orgs[org].Repos[repo] = repoSettings
+			}
+
+			for branch := range additional.Orgs[org].Repos[repo].Branches {
+				if bp.Orgs[org].Repos[repo].Branches == nil {
+					branchSettings := bp.Orgs[org].Repos[repo]
+					branchSettings.Branches = map[string]Branch{}
+					bp.Orgs[org].Repos[repo] = branchSettings
+				}
+
+				if isPolicySet(bp.Orgs[org].Repos[repo].Branches[branch].Policy) && isPolicySet(additional.Orgs[org].Repos[repo].Branches[branch].Policy) {
+					errs = append(errs, fmt.Errorf("both branchprotection configs define a policy for branch %s in repo %s/%s", branch, org, repo))
+				} else if _, ok := additional.Orgs[org].Repos[repo].Branches[branch]; ok && !isPolicySet(bp.Orgs[org].Repos[repo].Branches[branch].Policy) {
+					branchSettings := bp.Orgs[org].Repos[repo].Branches[branch]
+					branchSettings.Policy = additional.Orgs[org].Repos[repo].Branches[branch].Policy
+					bp.Orgs[org].Repos[repo].Branches[branch] = branchSettings
+				}
+			}
+		}
+	}
+
+	return utilerrors.NewAggregate(errs)
 }
 
 // GetOrg returns the org config after merging in any global policies.
@@ -189,8 +292,8 @@ func (bp BranchProtection) GetOrg(name string) *Org {
 
 // Org holds the default protection policy for an entire org, as well as any repo overrides.
 type Org struct {
-	Policy
-	Repos map[string]Repo `json:"repos,omitempty"`
+	Policy `json:",inline"`
+	Repos  map[string]Repo `json:"repos,omitempty"`
 }
 
 // GetRepo returns the repo config after merging in any org policies.
@@ -206,7 +309,7 @@ func (o Org) GetRepo(name string) *Repo {
 
 // Repo holds protection policy overrides for all branches in a repo, as well as specific branch overrides.
 type Repo struct {
-	Policy
+	Policy   `json:",inline"`
 	Branches map[string]Branch `json:"branches,omitempty"`
 }
 
@@ -226,13 +329,13 @@ func (r Repo) GetBranch(name string) (*Branch, error) {
 
 // Branch holds protection policy overrides for a particular branch.
 type Branch struct {
-	Policy
+	Policy `json:",inline"`
 }
 
 // GetBranchProtection returns the policy for a given branch.
 //
 // Handles merging any policies defined at repo/org/global levels into the branch policy.
-func (c *Config) GetBranchProtection(org, repo, branch string) (*Policy, error) {
+func (c *Config) GetBranchProtection(org, repo, branch string, presubmits []Presubmit) (*Policy, error) {
 	if _, present := c.BranchProtection.Orgs[org]; !present {
 		return nil, nil // only consider branches in configured orgs
 	}
@@ -241,23 +344,21 @@ func (c *Config) GetBranchProtection(org, repo, branch string) (*Policy, error) 
 		return nil, err
 	}
 
-	return c.GetPolicy(org, repo, branch, *b)
+	return c.GetPolicy(org, repo, branch, *b, presubmits)
 }
 
 // GetPolicy returns the protection policy for the branch, after merging in presubmits.
-func (c *Config) GetPolicy(org, repo, branch string, b Branch) (*Policy, error) {
+func (c *Config) GetPolicy(org, repo, branch string, b Branch, presubmits []Presubmit) (*Policy, error) {
 	policy := b.Policy
 
 	// Automatically require contexts from prow which must always be present
-	if prowContexts, _, _ := BranchRequirements(org, repo, branch, c.Presubmits); len(prowContexts) > 0 {
+	if prowContexts, requiredIfPresentContexts, optionalContexts := BranchRequirements(branch, presubmits); c.shouldManageRequiredStatusCheck(prowContexts, requiredIfPresentContexts, optionalContexts) {
 		// Error if protection is disabled
 		if policy.Protect != nil && !*policy.Protect {
-			if c.BranchProtection.AllowDisabledJobPolicies {
-				logrus.Warnf("%s/%s=%s has required jobs but has protect: false", org, repo, branch)
+			if c.BranchProtection.AllowDisabledJobPolicies != nil && *c.BranchProtection.AllowDisabledJobPolicies {
 				return nil, nil
-			} else {
-				return nil, fmt.Errorf("required prow jobs require branch protection")
 			}
+			return nil, fmt.Errorf("required prow jobs require branch protection")
 		}
 		ps := Policy{
 			RequiredStatusChecks: &ContextPolicy{
@@ -265,7 +366,7 @@ func (c *Config) GetPolicy(org, repo, branch string, b Branch) (*Policy, error) 
 			},
 		}
 		// Require protection by default if ProtectTested is true
-		if c.BranchProtection.ProtectTested {
+		if c.BranchProtection.ProtectTested != nil && *c.BranchProtection.ProtectTested {
 			yes := true
 			ps.Protect = &yes
 		}
@@ -276,13 +377,7 @@ func (c *Config) GetPolicy(org, repo, branch string, b Branch) (*Policy, error) 
 		// Ensure that protection is false => no protection settings
 		var old *bool
 		old, policy.Protect = policy.Protect, old
-		switch {
-		case policy.defined() && c.BranchProtection.AllowDisabledPolicies:
-			logrus.Warnf("%s/%s=%s defines a policy but has protect: false", org, repo, branch)
-			policy = Policy{
-				Protect: policy.Protect,
-			}
-		case policy.defined():
+		if policy.defined() && !boolValFromPtr(c.BranchProtection.AllowDisabledPolicies) {
 			return nil, fmt.Errorf("%s/%s=%s defines a policy, which requires protect: true", org, repo, branch)
 		}
 		policy.Protect = old
@@ -294,15 +389,100 @@ func (c *Config) GetPolicy(org, repo, branch string, b Branch) (*Policy, error) 
 	return &policy, nil
 }
 
+func (c *Config) shouldManageRequiredStatusCheck(requiredContexts, requiredIfPresentContexts, optionalContexts []string) bool {
+	if len(requiredContexts) > 0 {
+		return true
+	}
+	if c.BranchProtection.ProtectReposWithOptionalJobs == nil || !*c.BranchProtection.ProtectReposWithOptionalJobs {
+		return false
+	}
+	return len(requiredIfPresentContexts) > 0 || len(optionalContexts) > 0
+}
+
+func isUnprotected(policy Policy, allowDisabledPolicies bool, hasRequiredContexts bool, allowDisabledJobPolicies bool) bool {
+	if policy.Protect != nil && !*policy.Protect {
+		if hasRequiredContexts && allowDisabledJobPolicies {
+			return true
+		}
+		if allowDisabledPolicies {
+			policy.Protect = nil
+			if policy.defined() {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (c *Config) reposWithDisabledPolicy() []string {
+	repoWarns := sets.NewString()
+	for orgName, org := range c.BranchProtection.Orgs {
+		for repoName := range org.Repos {
+			repoPolicy := c.BranchProtection.GetOrg(orgName).GetRepo(repoName)
+			if isUnprotected(repoPolicy.Policy, boolValFromPtr(c.BranchProtection.AllowDisabledPolicies), false, false) {
+				repoWarns.Insert(fmt.Sprintf("%s/%s", orgName, repoName))
+			}
+		}
+	}
+	return repoWarns.List()
+}
+
+// boolValFromPtr returns the bool value from a bool pointer.
+// Nil counts as false. We need the boolpointers to be able
+// to differentiate unset from false in the serialization.
+func boolValFromPtr(b *bool) bool {
+	return b != nil && *b
+}
+
+// unprotectedBranches returns the set of names of branches
+// which have protection flag set to false, but have either:
+// a. a protection policy, or
+// b. a required context
+func (c *Config) unprotectedBranches(presubmits map[string][]Presubmit) []string {
+	branchWarns := sets.NewString()
+	for orgName, org := range c.BranchProtection.Orgs {
+		for repoName, repo := range org.Repos {
+			branches := sets.NewString()
+			for branchName := range repo.Branches {
+				b, err := c.BranchProtection.GetOrg(orgName).GetRepo(repoName).GetBranch(branchName)
+				if err != nil {
+					continue
+				}
+				policy, err := c.GetPolicy(orgName, repoName, branchName, *b, []Presubmit{})
+				if err != nil || policy == nil {
+					continue
+				}
+				requiredContexts, _, _ := BranchRequirements(branchName, presubmits[orgName+"/"+repoName])
+				if isUnprotected(*policy, boolValFromPtr(c.BranchProtection.AllowDisabledPolicies), len(requiredContexts) > 0, boolValFromPtr(c.BranchProtection.AllowDisabledJobPolicies)) {
+					branches.Insert(branchName)
+				}
+			}
+			if branches.Len() > 0 {
+				branchWarns.Insert(fmt.Sprintf("%s/%s=%s", orgName, repoName, strings.Join(branches.List(), ",")))
+			}
+		}
+	}
+	return branchWarns.List()
+}
+
+// BranchProtectionWarnings logs two sets of warnings:
+// - The list of repos with unprotected branches,
+// - The list of repos with disabled policies, i.e. Protect set to false,
+//     because any branches not explicitly specified in the configuration will be unprotected.
+func (c *Config) BranchProtectionWarnings(logger *logrus.Entry, presubmits map[string][]Presubmit) {
+	if warnings := c.reposWithDisabledPolicy(); len(warnings) > 0 {
+		logger.WithField("repos", strings.Join(warnings, ",")).Debug("The following repos define a policy, but have protect: false")
+	}
+	if warnings := c.unprotectedBranches(presubmits); len(warnings) > 0 {
+		logger.WithField("repos", strings.Join(warnings, ",")).Debug("The following repos define a policy or require context(s), but have one or more branches with protect: false")
+	}
+}
+
 // BranchRequirements partitions status contexts for a given org, repo branch into three buckets:
 //  - contexts that are always required to be present
 //  - contexts that are required, _if_ present
 //  - contexts that are always optional
-func BranchRequirements(org, repo, branch string, presubmits map[string][]Presubmit) ([]string, []string, []string) {
-	jobs, ok := presubmits[org+"/"+repo]
-	if !ok {
-		return nil, nil, nil
-	}
+func BranchRequirements(branch string, jobs []Presubmit) ([]string, []string, []string) {
 	var required, requiredIfPresent, optional []string
 	for _, j := range jobs {
 		if !j.CouldRun(branch) {

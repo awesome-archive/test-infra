@@ -18,15 +18,6 @@ set -o nounset
 set -o pipefail
 set -o xtrace
 
-# set a fixed version so that users of this script manually upgrade kind
-# in a controlled fashion along with the script contents (config, flags...)
-#
-# NOTE: temporarily we are using a specific HEAD commit so that we
-# - get some fixes related to Kubernetes's build changing
-# - don't get surprised when kind changes between now and the next stable release
-# We should switch back to a release tag at the next release.
-STABLE_KIND_VERSION=v0.5.1
-
 # our exit handler (trap)
 cleanup() {
     # always attempt to dump logs
@@ -48,30 +39,20 @@ cleanup() {
 install_kind() {
     # install `kind` to tempdir
     TMP_DIR=$(mktemp -d)
-    # ensure bin dir
-    mkdir -p "${TMP_DIR}/bin"
-    pushd "${TMP_DIR}"
-    env "GOPATH=${TMP_DIR}" GO111MODULE="on" go get -u "sigs.k8s.io/kind@${STABLE_KIND_VERSION}"
-    popd
-    PATH="${TMP_DIR}/bin:${PATH}"
+    curl -sLo "${TMP_DIR}/kind" https://kind.sigs.k8s.io/dl/latest/kind-linux-amd64
+    chmod +x "${TMP_DIR}/kind"
+    PATH="${TMP_DIR}:${PATH}"
     export PATH
 }
 
 # build kubernetes / node image, e2e binaries
 build() {
-    # possibly enable bazel build caching before building kubernetes
-    BAZEL_REMOTE_CACHE_ENABLED=${BAZEL_REMOTE_CACHE_ENABLED:-false}
-    if [[ "${BAZEL_REMOTE_CACHE_ENABLED}" == "true" ]]; then
-        # run the script in the kubekins image, do not fail if it fails
-        /usr/local/bin/create_bazel_cache_rcs.sh || true
-    fi
-
     # build the node image w/ kubernetes
-    kind build node-image --type=bazel --kube-root="${PWD}"
+    kind build node-image --kube-root="${PWD}"
 
-    # try to make sure the kubectl we built is in PATH
+    # ensure kubectl is in path
     local maybe_kubectl
-    maybe_kubectl="$(find "${PWD}/bazel-bin/" -name "kubectl" -type f)"
+    maybe_kubectl="$(find "${PWD}/_output" -name "kubectl" -type f)"
     if [[ -n "${maybe_kubectl}" ]]; then
         PATH="$(dirname "${maybe_kubectl}"):${PATH}"
         export PATH
@@ -90,7 +71,7 @@ create_cluster() {
 # config for 1 control plane node and 2 workers
 # necessary for conformance
 kind: Cluster
-apiVersion: kind.sigs.k8s.io/v1alpha3
+apiVersion: kind.x-k8s.io/v1alpha4
 nodes:
 # the control plane node
 - role: control-plane
@@ -100,6 +81,10 @@ EOF
     # mark the cluster as up for cleanup
     # even if kind create fails, kind delete can clean up after it
     KIND_IS_UP=true
+
+    KUBECONFIG="${HOME}/.kube/kind-config-default"
+    export KUBECONFIG
+
     # actually create, with:
     # - do not delete created nodes from a failed cluster create (for debugging)
     # - wait up to one minute for the nodes to be "READY"
@@ -117,9 +102,14 @@ EOF
 run_tests() {
   # binaries needed by the conformance image
   rm -rf _output/bin
-  NEW_GO_RUNNER_DIR="cluster/images/conformance/go-runner"
-  if [ -d "$NEW_GO_RUNNER_DIR" ]; then
-      make WHAT="test/e2e/e2e.test vendor/github.com/onsi/ginkgo/ginkgo cmd/kubectl cluster/images/conformance/go-runner"
+  # after https://github.com/kubernetes/kubernetes/pull/103874
+  NEW_CONFORMANCE_DIR="test/conformance/image"
+  # before https://github.com/kubernetes/kubernetes/pull/103874
+  OLD_CONFORMANCE_DIR="cluster/images/conformance"
+  if [ -d "${NEW_CONFORMANCE_DIR}/go-runner" ]; then
+      make WHAT="test/e2e/e2e.test vendor/github.com/onsi/ginkgo/ginkgo cmd/kubectl ${NEW_CONFORMANCE_DIR}/go-runner"
+  elif [ -d "${OLD_CONFORMANCE_DIR}/go-runner" ]; then
+      make WHAT="test/e2e/e2e.test vendor/github.com/onsi/ginkgo/ginkgo cmd/kubectl ${OLD_CONFORMANCE_DIR}/go-runner"
   else
       make WHAT="test/e2e/e2e.test vendor/github.com/onsi/ginkgo/ginkgo cmd/kubectl"
   fi
@@ -131,10 +121,15 @@ run_tests() {
 
   VERSION=$(echo -n "${KUBE_GIT_VERSION}" | cut -f 1 -d '+')
   export VERSION
-  KUBECONFIG=$(kind get kubeconfig-path)
-  export KUBECONFIG
 
-  pushd ${PWD}/cluster/images/conformance
+  if [ -d "${NEW_CONFORMANCE_DIR}" ]; then
+      pushd "${PWD}/${NEW_CONFORMANCE_DIR}"
+  elif [ -d "${OLD_CONFORMANCE_DIR}" ]; then
+      pushd "${PWD}/${OLD_CONFORMANCE_DIR}"
+  else
+      echo "Conformance dir not found"
+      exit 1
+  fi
 
   # build and load the conformance image into the kind nodes
   make build ARCH=amd64

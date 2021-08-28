@@ -18,12 +18,15 @@ package kube
 
 import (
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/sirupsen/logrus"
 
 	prowapi "k8s.io/test-infra/prow/apis/prowjobs/v1"
 )
 
 var (
 	metricLabels = []string{
+		// namespace of the job
+		"job_namespace",
 		// name of the job
 		"job_name",
 		// type of the prowjob: presubmit, postsubmit, periodic, batch
@@ -36,6 +39,8 @@ var (
 		"repo",
 		// the base_ref of the prowjob's repo
 		"base_ref",
+		// the cluster the job runs on
+		"cluster",
 	}
 	prowJobs = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "prowjobs",
@@ -48,16 +53,18 @@ var (
 )
 
 type jobLabel struct {
-	jobName string
-	jobType string
-	state   string
-	org     string
-	repo    string
-	baseRef string
+	jobNamespace string
+	jobName      string
+	jobType      string
+	state        string
+	org          string
+	repo         string
+	baseRef      string
+	cluster      string
 }
 
 func (jl *jobLabel) values() []string {
-	return []string{jl.jobName, jl.jobType, jl.state, jl.org, jl.repo, jl.baseRef}
+	return []string{jl.jobNamespace, jl.jobName, jl.jobType, jl.state, jl.org, jl.repo, jl.baseRef, jl.cluster}
 }
 
 func init() {
@@ -75,7 +82,7 @@ func getJobLabelMap(pjs []prowapi.ProwJob) map[jobLabel]float64 {
 }
 
 func getJobLabel(pj prowapi.ProwJob) jobLabel {
-	jl := jobLabel{jobName: pj.Spec.Job, jobType: string(pj.Spec.Type), state: string(pj.Status.State)}
+	jl := jobLabel{jobNamespace: pj.Namespace, jobName: pj.Spec.Job, jobType: string(pj.Spec.Type), state: string(pj.Status.State), cluster: pj.Spec.Cluster}
 
 	if pj.Spec.Refs != nil {
 		jl.org = pj.Spec.Refs.Org
@@ -107,7 +114,7 @@ var previousStates map[jobIdentifier]prowapi.ProwJobState
 
 // GatherProwJobMetrics gathers prometheus metrics for prowjobs.
 // Not threadsafe, ensure this is called serially.
-func GatherProwJobMetrics(current []prowapi.ProwJob) {
+func GatherProwJobMetrics(l *logrus.Entry, current []prowapi.ProwJob) {
 	// This may be racing with the prometheus server but we need to remove
 	// stale metrics like triggered or pending jobs that are now complete.
 	prowJobs.Reset()

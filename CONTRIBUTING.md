@@ -87,7 +87,7 @@ up to date
 
 ### Dependency Management
 
-Please see [/docs/deps.md]
+Please see [/docs/dep.md]
 
 ### Prow Jobs
 
@@ -116,7 +116,7 @@ has test coverage in a variety of environments. For more info please see
 [contrib-cheatsheet]: https://git.k8s.io/community/contributors/guide/contributor-cheatsheet
 [cla]: https://github.com/kubernetes/community/blob/master/CLA.md
 [owners]: https://go.k8s.io/owners
-[KEP]: https://github.com/kubernetes/enhancements/blob/master/keps/YYYYMMDD-kep-template.md
+[KEP]: https://github.com/kubernetes/enhancements/blob/master/keps/NNNN-kep-template
 
 [sig-testing]: https://github.com/kubernetes/community/tree/master/sig-testing
 [#sig-testing]: https://kubernetes.slack.com/messages/sig-testing
@@ -134,7 +134,7 @@ has test coverage in a variety of environments. For more info please see
 [/README.md]: /README.md
 [/config/jobs/README.md]: /config/jobs/README.md
 [/docs/contributing-test-results.md]: /docs/contributing-test-results.md
-[/docs/deps.md]: /docs/deps.md
+[/docs/dep.md]: /docs/dep.md
 [/label_sync/README.md]: /label_sync/README.md
 [/testgrid/README.md]: /testgrid/README.md
 

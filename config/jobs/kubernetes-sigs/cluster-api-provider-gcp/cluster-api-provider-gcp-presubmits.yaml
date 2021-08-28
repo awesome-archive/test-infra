@@ -5,11 +5,17 @@ presubmits:
     optional: false
     decorate: true
     path_alias: "sigs.k8s.io/cluster-api-provider-gcp"
+    branches:
+    - ^main$
     spec:
       containers:
-      - image: gcr.io/k8s-testimages/kubekins-e2e:v20190920-5a67b1f-experimental
+      - image: gcr.io/k8s-testimages/kubekins-e2e:v20210825-f1955d1-master
         command:
         - "./scripts/ci-test.sh"
+        resources:
+          requests:
+            memory: "6Gi"
+            cpu: "2"
     annotations:
       testgrid-dashboards: sig-cluster-lifecycle-cluster-api-provider-gcp
       testgrid-tab-name: pr-test
@@ -18,11 +24,17 @@ presubmits:
     optional: false
     decorate: true
     path_alias: "sigs.k8s.io/cluster-api-provider-gcp"
+    branches:
+    - ^main$
     spec:
       containers:
-      - image: gcr.io/k8s-testimages/kubekins-e2e:v20190920-5a67b1f-experimental
+      - image: gcr.io/k8s-testimages/kubekins-e2e:v20210825-f1955d1-master
         command:
         - "./scripts/ci-build.sh"
+        resources:
+          requests:
+            memory: "6Gi"
+            cpu: "2"
     annotations:
       testgrid-dashboards: sig-cluster-lifecycle-cluster-api-provider-gcp
       testgrid-tab-name: pr-build
@@ -32,34 +44,185 @@ presubmits:
     decorate: true
     labels:
       preset-dind-enabled: "true"
+      preset-kind-volume-mounts: "true"
     path_alias: "sigs.k8s.io/cluster-api-provider-gcp"
+    branches:
+    - ^main$
     spec:
       containers:
-      - image: gcr.io/k8s-testimages/kubekins-e2e:v20190920-5a67b1f-experimental
+      - image: gcr.io/k8s-testimages/kubekins-e2e:v20210825-f1955d1-master
         # docker-in-docker needs privileged mode
         securityContext:
           privileged: true
         command:
         - "runner.sh"
         - "./scripts/ci-make.sh"
-        volumeMounts:
-        - mountPath: /lib/modules
-          name: modules
-          readOnly: true
-        - mountPath: /sys/fs/cgroup
-          name: cgroup
         resources:
           requests:
             memory: "6Gi"
-      volumes:
-      - name: modules
-        hostPath:
-          path: /lib/modules
-          type: Directory
-      - name: cgroup
-        hostPath:
-          path: /sys/fs/cgroup
-          type: Directory
+            cpu: "2"
     annotations:
       testgrid-dashboards: sig-cluster-lifecycle-cluster-api-provider-gcp
       testgrid-tab-name: pr-make
+  - name: pull-cluster-api-provider-gcp-e2e-test
+    labels:
+      preset-service-account: "true"
+      preset-bazel-scratch-dir: "true"
+      preset-bazel-remote-cache-enabled: "true"
+      preset-dind-enabled: "true"
+      preset-kind-volume-mounts: "true"
+    path_alias: "sigs.k8s.io/cluster-api-provider-gcp"
+    branches:
+    - ^main$
+    always_run: true
+    optional: false
+    decorate: true
+    decoration_config:
+      timeout: 3h
+    spec:
+      containers:
+        - image: gcr.io/k8s-testimages/kubekins-e2e:v20210825-f1955d1-master
+          env:
+            - name: "BOSKOS_HOST"
+              value: "boskos.test-pods.svc.cluster.local"
+          command:
+            - "runner.sh"
+            - "./scripts/ci-e2e.sh"
+          # we need privileged mode in order to do docker in docker
+          securityContext:
+            privileged: true
+          resources:
+            requests:
+              # these are both a bit below peak usage during build
+              # this is mostly for building kubernetes
+              memory: "9000Mi"
+              # during the tests more like 3-20m is used
+              cpu: 2000m
+    annotations:
+      testgrid-dashboards: sig-cluster-lifecycle-cluster-api-provider-gcp
+      testgrid-tab-name: pr-e2e-test
+  # conformance test against kubernetes master branch with `kind` + cluster-api-provider-gcp
+  - name: pull-cluster-api-provider-gcp-conformance-ci-artifacts
+    labels:
+      preset-service-account: "true"
+      preset-bazel-scratch-dir: "true"
+      preset-bazel-remote-cache-enabled: "true"
+      preset-dind-enabled: "true"
+      preset-kind-volume-mounts: "true"
+    path_alias: "sigs.k8s.io/cluster-api-provider-gcp"
+    branches:
+    - ^main$
+    always_run: false
+    optional: true
+    decorate: true
+    decoration_config:
+      timeout: 3h
+    extra_refs:
+    - org: kubernetes-sigs
+      repo: image-builder
+      base_ref: master
+      path_alias: "sigs.k8s.io/image-builder"
+    - org: kubernetes
+      repo: kubernetes
+      base_ref: master
+      path_alias: k8s.io/kubernetes
+    spec:
+      containers:
+        - image: gcr.io/k8s-testimages/kubekins-e2e:v20210825-f1955d1-master
+          env:
+            - name: "BOSKOS_HOST"
+              value: "boskos.test-pods.svc.cluster.local"
+          command:
+            - "runner.sh"
+            - "./scripts/ci-conformance.sh"
+            - "--use-ci-artifacts"
+          # we need privileged mode in order to do docker in docker
+          securityContext:
+            privileged: true
+          resources:
+            requests:
+              # these are both a bit below peak usage during build
+              # this is mostly for building kubernetes
+              memory: "9000Mi"
+              # during the tests more like 3-20m is used
+              cpu: 2000m
+    annotations:
+      testgrid-dashboards: sig-cluster-lifecycle-cluster-api-provider-gcp
+      testgrid-tab-name: pr-conformance-ci-artifacts
+  - name: pull-cluster-api-provider-gcp-conformance
+    labels:
+      preset-service-account: "true"
+      preset-bazel-scratch-dir: "true"
+      preset-bazel-remote-cache-enabled: "true"
+      preset-dind-enabled: "true"
+      preset-kind-volume-mounts: "true"
+    path_alias: "sigs.k8s.io/cluster-api-provider-gcp"
+    branches:
+    - ^main$
+    always_run: false
+    optional: true
+    decorate: true
+    decoration_config:
+      timeout: 3h
+    extra_refs:
+    - org: kubernetes
+      repo: kubernetes
+      base_ref: release-1.20
+      path_alias: k8s.io/kubernetes
+    spec:
+      containers:
+        - image: gcr.io/k8s-testimages/kubekins-e2e:v20210825-f1955d1-master
+          env:
+            - name: "BOSKOS_HOST"
+              value: "boskos.test-pods.svc.cluster.local"
+          command:
+            - "runner.sh"
+            - "./scripts/ci-conformance.sh"
+          # we need privileged mode in order to do docker in docker
+          securityContext:
+            privileged: true
+          resources:
+            requests:
+              # these are both a bit below peak usage during build
+              # this is mostly for building kubernetes
+              memory: "9000Mi"
+              # during the tests more like 3-20m is used
+              cpu: 2000m
+    annotations:
+      testgrid-dashboards: sig-cluster-lifecycle-cluster-api-provider-gcp
+      testgrid-tab-name: pr-conformance
+  - name: pull-cluster-api-provider-gcp-capi-e2e
+    labels:
+      preset-service-account: "true"
+      preset-bazel-scratch-dir: "true"
+      preset-bazel-remote-cache-enabled: "true"
+      preset-dind-enabled: "true"
+      preset-kind-volume-mounts: "true"
+    path_alias: "sigs.k8s.io/cluster-api-provider-gcp"
+    branches:
+    - ^main$
+    always_run: false
+    optional: true
+    decorate: true
+    decoration_config:
+      timeout: 3h
+    spec:
+      containers:
+        - image: gcr.io/k8s-testimages/kubekins-e2e:v20210825-f1955d1-master
+          env:
+            - name: "BOSKOS_HOST"
+              value: "boskos.test-pods.svc.cluster.local"
+            - name: GINKGO_FOCUS
+              value: "Cluster API E2E tests"
+          command:
+            - "runner.sh"
+            - "./scripts/ci-e2e.sh"
+          securityContext:
+            privileged: true
+          resources:
+            requests:
+              memory: "9000Mi"
+              cpu: 2000m
+    annotations:
+      testgrid-dashboards: sig-cluster-lifecycle-cluster-api-provider-gcp
+      testgrid-tab-name: pr-capi-e2e-test

@@ -1,5 +1,5 @@
-load("@py_deps//:requirements.bzl", "requirement")
-load("@build_bazel_rules_nodejs//:defs.bzl", "nodejs_binary", "nodejs_test")
+load("@py3_deps//:requirements.bzl", "requirement")
+load("@build_bazel_rules_nodejs//:index.bzl", "nodejs_binary", "nodejs_test")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -11,14 +11,6 @@ py_test(
         "coalesce_test.py",
     ],
     python_version = "PY3",
-)
-
-py_test(
-    name = "verify_boilerplate",
-    srcs = ["verify_boilerplate.py"],
-    data = ["//:all-srcs"],
-    python_version = "PY3",
-    tags = ["lint"],
 )
 
 sh_test(
@@ -71,13 +63,15 @@ sh_test(
         "$(location @io_k8s_code_generator//cmd/deepcopy-gen)",
         "$(location @io_k8s_code_generator//cmd/informer-gen)",
         "$(location @io_k8s_code_generator//cmd/lister-gen)",
+        "$(location @com_github_go_bindata_go_bindata_v3//go-bindata)",
     ],
     data = [
-        ":boilerplate/boilerplate.generated.go.txt",
+        ":boilerplate/boilerplate.generated.go.txt",  # TODO(fejta): use repo-infra version
         ":update-codegen",
         "//:go.mod",
         "//:go.sum",
         "@//:all-srcs",
+        "@com_github_go_bindata_go_bindata_v3//go-bindata",
         "@go_sdk//:files",
         "@io_k8s_code_generator//cmd/client-gen",
         "@io_k8s_code_generator//cmd/deepcopy-gen",
@@ -95,11 +89,13 @@ sh_binary(
         "$(location @io_k8s_code_generator//cmd/deepcopy-gen)",
         "$(location @io_k8s_code_generator//cmd/informer-gen)",
         "$(location @io_k8s_code_generator//cmd/lister-gen)",
+        "$(location @com_github_go_bindata_go_bindata_v3//go-bindata)",
     ],
     data = [
-        ":boilerplate/boilerplate.generated.go.txt",
+        ":boilerplate/boilerplate.generated.go.txt",  # TODO(fejta): use repo-infra version
         "//:go.mod",
         "//:go.sum",
+        "@com_github_go_bindata_go_bindata_v3//go-bindata",
         "@go_sdk//:files",
         "@io_k8s_code_generator//cmd/client-gen",
         "@io_k8s_code_generator//cmd/deepcopy-gen",
@@ -157,12 +153,12 @@ sh_binary(
     args = [
         "$(location %s)" % protoc,
         "$(location %s)" % protoc_gen_go,
-        "$(location %s)" % ":boilerplate/boilerplate.generated.go.txt",
+        "$(location %s)" % ":boilerplate/boilerplate.generated.go.txt",  # TODO(fejta): use repo-infra version
         protoc_grpc,
         proto_importmap,
     ],
     data = [
-        ":boilerplate/boilerplate.generated.go.txt",
+        ":boilerplate/boilerplate.generated.go.txt",  # TODO(fejta): use repo-infra version
         "//:all-srcs",
         protoc,
         protoc_gen_go,
@@ -177,12 +173,12 @@ sh_test(
         "$(location %s)" % ":update-protos",
         "$(location %s)" % protoc,
         "$(location %s)" % protoc_gen_go,
-        "$(location %s)" % ":boilerplate/boilerplate.generated.go.txt",
+        "$(location %s)" % ":boilerplate/boilerplate.generated.go.txt",  # TODO(fejta): use repo-infra version
         protoc_grpc,
         proto_importmap,
     ],
     data = [
-        ":boilerplate/boilerplate.generated.go.txt",
+        ":boilerplate/boilerplate.generated.go.txt",  # TODO(fejta): use repo-infra version
         ":update-protos",
         protoc,
         protoc_gen_go,
@@ -216,95 +212,31 @@ sh_test(
 
 test_suite(
     name = "verify-all",
+    tests = [
+        ":verify-linters",
+        "@io_k8s_repo_infra//hack:verify-all",
+    ],
+)
+
+test_suite(
+    name = "verify-linters",
     tags = ["lint"],  # picks up all non-manual targets with this tag
-)
-
-GAZELLE = "@bazel_gazelle//cmd/gazelle"
-
-KAZEL = "@io_k8s_repo_infra//cmd/kazel"
-
-GO = "@go_sdk//:bin/go"
-
-sh_binary(
-    name = "update-deps",
-    srcs = ["update-deps.sh"],
-    args = [
-        "$(location %s)" % GO,
-        "$(location %s)" % GAZELLE,
-        "$(location %s)" % KAZEL,
-        "$(location :update-bazel)",
-    ],
-    data = [
-        GAZELLE,
-        GO,
-        KAZEL,
-        ":update-bazel",
-    ],
-)
-
-sh_test(
-    name = "verify-deps",
-    srcs = ["verify-deps.sh"],
-    args = [
-        "$(location :update-deps)",
-        "$(location %s)" % GO,
-        "$(location %s)" % GAZELLE,
-        "$(location %s)" % KAZEL,
-        "$(location :update-bazel)",
-    ],
-    data = [
-        GAZELLE,
-        GO,
-        KAZEL,
-        ":update-bazel",
-        ":update-deps",
-        "@//:all-srcs",
-    ],
-    tags = ["lint"],
-)
-
-sh_binary(
-    name = "update-bazel",
-    srcs = ["update-bazel.sh"],
-    args = [
-        "$(location %s)" % GAZELLE,
-        "$(location %s)" % KAZEL,
-    ],
-    data = [
-        GAZELLE,
-        KAZEL,
-    ],
-)
-
-sh_test(
-    name = "verify-bazel",
-    srcs = ["verify-bazel.sh"],
-    args = [
-        "$(location %s)" % GAZELLE,
-        "$(location %s)" % KAZEL,
-    ],
-    data = [
-        "@//:all-srcs",
-        GAZELLE,
-        KAZEL,
-    ],
-    tags = ["lint"],
 )
 
 py_binary(
     name = "pylint_bin",
     srcs = ["pylint_bin.py"],
-    python_version = "PY2",
+    python_version = "PY3",
     tags = ["lint"],
     # NOTE: this should only contain direct third party imports and pylint
     deps = [
         requirement("astroid"),
         requirement("backports.functools_lru_cache"),
         requirement("configparser"),
-        requirement("enum34"),
         requirement("influxdb"),
         requirement("isort"),
         requirement("lazy-object-proxy"),
+        requirement("parameterized"),
         requirement("pylint"),
         requirement("pytz"),
         requirement("PyYAML"),
@@ -319,46 +251,10 @@ py_binary(
 )
 
 sh_binary(
-    name = "update-gofmt",
-    srcs = ["update-gofmt.sh"],
-    args = ["$(location @go_sdk//:bin/gofmt)"],
-    data = ["@go_sdk//:bin/gofmt"],
-)
-
-sh_test(
-    name = "verify-gofmt",
-    srcs = ["verify-gofmt.sh"],
-    args = ["$(location @go_sdk//:bin/gofmt)"],
-    data = [
-        "@//:all-srcs",
-        "@go_sdk//:bin/gofmt",
-    ],
-    tags = ["lint"],
-)
-
-sh_test(
-    name = "verify-config",
-    srcs = ["verify-config.sh"],
-    args = [
-        "$(location //prow/cmd/checkconfig)",
-        "--config-path=config/prow/config.yaml",
-        "--job-config-path=config/jobs",
-        "--plugin-config=config/prow/plugins.yaml",
-    ],
-    data = [
-        "//config:all-srcs",
-        "//config/prow:config.yaml",
-        "//config/prow:plugins.yaml",
-        "//prow/cmd/checkconfig",
-    ],
-    tags = ["lint"],
-)
-
-sh_binary(
     name = "update-gopherage",
     srcs = ["update-gopherage.sh"],
     data = [
-        "//gopherage/cmd/html/static:zz.browser_bundle.es2015.js",
+        "//gopherage/cmd/html/static:browser_bundle.es2015.js",
     ],
 )
 
@@ -367,7 +263,6 @@ sh_test(
     srcs = ["verify-gopherage.sh"],
     data = [
         "//gopherage/cmd/html/static:browser_bundle.es2015.js",
-        "//gopherage/cmd/html/static:zz.browser_bundle.es2015.js",
     ],
     tags = ["lint"],
 )

@@ -2,8 +2,17 @@
 
 For a brief overview of how Prow runs jobs take a look at ["Life of a Prow Job"](/prow/life_of_a_prow_job.md).
 
-For a brief cookbook for jobs intended for [prow.k8s.io], please refer to
+For a brief cookbook for jobs intended for [prow.k8s.io](https://prow.k8s.io/), please refer to
 [`config/jobs/README.md`](/config/jobs/README.md)
+
+Make sure Prow has been [deployed] correctly:
+
+* The `horologium` component schedules periodic jobs.
+* The `hook` component schedules presubmit and postsubmit jobs, ensuring the repo:
+  - enabled `trigger` in [`plugins.yaml`]
+  - sends GitHub webhooks to prow.
+* The `plank` component schedules the pod requested by a prowjob.
+* The `crier` component reports status back to github.
 
 ## How to configure new jobs
 
@@ -11,19 +20,34 @@ To configure a new job you'll need to add an entry into [config.yaml](/config/pr
 If you have [update-config](/prow/plugins/updateconfig) plugin deployed then the
 config will be automatically updated once the PR is merged, else you will need
 to run `make update-config`. This does not require redeploying any binaries,
-and will take effect within a minute.
+and will take effect within a few minutes.
 
-Periodic config looks like so:
+Alternatively, the [inrepoconfig](/prow/inrepoconfig.md) feature can be used to version Presubmit jobs
+in the same repository that also contains the code and have Prow load them dynamically.
+See [its documentation](/prow/inrepoconfig.md) for more details.
+
+Prow requires you to have a basic understanding of kubernetes, such
+that you can define pods in yaml.  Please see kubernetes documentation
+for help here, for example the [Pod overview] and [PodSpec api
+reference].
+
+Periodic config looks like so (see [GoDocs](https://pkg.go.dev/k8s.io/test-infra/prow/config#Periodic) for complete config):
 
 ```yaml
 periodics:
 - name: foo-job         # Names need not be unique, but must match the regex ^[A-Za-z0-9-._]+$
   decorate: true        # Enable Pod Utility decoration. (see below)
   interval: 1h          # Anything that can be parsed by time.ParseDuration.
+  # Alternatively use a cron instead of an interval, for example:
+  # cron: "05 15 * * 1-5"  # Run at 7:05 PST (15:05 UTC) every M-F
+  extra_refs:            # Periodic job doesn't clone any repo by default, needs to be added explicitly
+  - org: org
+    repo: repo
+    base_ref: main
   spec: {}              # Valid Kubernetes PodSpec.
 ```
 
-Postsubmit config looks like so:
+Postsubmit config looks like so (see [GoDocs](https://pkg.go.dev/k8s.io/test-infra/prow/config#Postsubmit) for complete config):
 
 ```yaml
 postsubmits:
@@ -33,7 +57,7 @@ postsubmits:
     spec: {}              # As for periodics.
     max_concurrency: 10   # Run no more than this number concurrently.
     branches:             # Regexps, only run against these branches.
-    - ^master$
+    - ^main$
     skip_branches:        # Regexps, do not run against these branches.
     - ^release-.*$
 ```
@@ -42,7 +66,7 @@ Postsubmits are run when a push event happens on a repo, hence they are
 configured per-repo. If no `branches` are specified, then they will run against
 every branch.
 
-Presubmit config looks like so:
+Presubmit config looks like so (see [GoDocs](https://pkg.go.dev/k8s.io/test-infra/prow/config#Presubmit) for complete config):
 
 ```yaml
 presubmits:
@@ -61,17 +85,19 @@ presubmits:
     rerun_command: "qux test this please"  # String, see discussion.
 ```
 
-If you only want to run tests when specific files are touched, you can use
-`run_if_changed`. A useful pattern when adding new jobs is to start with
-`always_run` set to false and `skip_report` set to true. Test it out a few
-times by manually triggering, then switch `always_run` to true. Watch for a
-couple days, then switch `skip_report` to false.
-
 The `trigger` is a regexp that matches the `rerun_command`. Users will be told
 to input the `rerun_command` when they want to rerun the job. Actually, anything
 that matches `trigger` will suffice. This is useful if you want to make one
 command that reruns all jobs. If unspecified, the default configuration makes
 `/test <job-name>` trigger the job.
+
+See the [Triggering Jobs](#triggering-jobs) section below to learn how to
+control when jobs are automatically run. We also have sections about [posting](#posting-github-status-contexts)
+and [requiring](#requiring-job-statuses) GitHub status contexts. A useful
+pattern when adding new jobs is to start with `always_run` set to false and
+`skip_report` set to true. Test it out a few times by manually triggering,
+then switch `always_run` to true. Watch for a couple days, then switch
+`skip_report` to false.
 
 ## Presets
 
@@ -99,6 +125,20 @@ presets:
   - name: bar
     mountPath: /etc/bar
     readOnly: true
+```
+
+And to use the preset, add corresponding label in prow job definition like:
+
+```yaml
+- name: obfsucated-job-with-mysteriously-hidden-side-effects
+  labels:
+    preset-foo-bar: "true"
+```
+
+Alternatively, annonymous presets can be applied to all jobs, the config looks
+like:
+
+```yaml
 - env:                     # a preset with no labels is applied to all jobs
   - name: BAZ
     value: qux
@@ -123,23 +163,67 @@ rules for protecting those contexts on branches.
  1. jobs that run unconditionally and automatically. All jobs that set
      `always_run: true` fall into this set.
  2. jobs that run conditionally, but automatically. All jobs that set
-    `run_if_changed` to some value fall into this set.
+    `run_if_changed` or `skip_if_only_changed` to some value fall into this
+    set.
  3. jobs that run conditionally, but not automatically. All jobs that set
-    `always_run: false` and do not set `run_if_changed` to any value fall
-    into this set and require a human to trigger them with a command.
+    `always_run: false` and do not set `run_if_changed`/`skip_if_only_changed`
+    to any value fall into this set and require a human to trigger them with a
+    command.
 
-By default, jobs fall into the third category and must have their `always_run` or
-`run_if_changed` configured to operate differently.
+By default, jobs fall into the third category and must have their `always_run`,
+`run_if_changed`, or `skip_if_only_changed` configured to operate differently.
 
 In the rest of this document, "a job running unconditionally" indicates that the
 job will run even if it is normally conditional and the conditions are not met.
 Similarly, "a job running conditionally" indicates that the job runs if all of its
 conditions are met.
 
+#### Triggering Jobs Based On Changes
+
+Jobs that set `always_run: false` may be configured to run conditionally based
+on the contents of the pull request. `run_if_changed` and
+`skip_if_only_changed` accept a (Golang-style) [regular expression] which is
+run against the path of each changed file.
+
+`run_if_changed` triggers the job if _any_ path matches. For example, you may
+wish to trigger a compilation job if the pull request changes any `*.c` or
+`*.h` file, or the `Makefile`:
+
+```yaml
+presubmits:
+  org/repo:
+  - name: compile-job
+    always_run: false
+    run_if_changed: "(\\.[ch]|^Makefile)$"
+    ...
+```
+
+`skip_if_only_changed` _skips_ the job if _all_ paths match. For example, you
+may wish to skip a compilation job for pull requests that only change
+documentation files:
+
+```yaml
+presubmits:
+  org/repo:
+  - name: compile-job
+    always_run: false
+    skip_if_only_changed: "^docs/|\\.(md|adoc)$|^(README|LICENSE)$"
+```
+
+Both of the above examples would trigger on a pull request containing
+`foo/bar.c` and `SECURITY.md`, but not one containing only `SECURITY.md`.
+
+Note:
+- `run_if_changed` and `skip_if_only_changed` are mutually exclusive.
+- Jobs which would otherwise be skipped based on this configuration can still
+  be triggered explicitly with comments (see below).
+- Only presubmit and postsubmit jobs are inherently associated with git refs and can use these fields.
+
 #### Triggering Jobs With Comments
 
 A developer may trigger presubmits by posting a comment to a pull request that
 contains one or more of the following phrases:
+
  - `/test job-name` : When posting `/test job-name`, any jobs with matching triggers
    will be triggered unconditionally.
  - `/retest` : When posting `/retest`, two types of jobs will be triggered:
@@ -148,7 +232,7 @@ contains one or more of the following phrases:
  - `/test all` : When posting `/test all`, all automatically run jobs will run
    conditionally.
 
-Note: is is possible to configure a job's `trigger` to match any of the above keywords
+Note: It is possible to configure a job's `trigger` to match any of the above keywords
 (`/retest` and/or `/test all`) but this behavior is not suggested as it will confuse
 developers that expect consistent behavior from these commands. More generally, it is
 possible to configure a job's `trigger` to match any command that is otherwise known
@@ -156,17 +240,19 @@ to Prow in some other context, like `/close`. It is similarly not suggested to d
 
 #### Posting GitHub Status Contexts
 
-Presubmit and postsubmit jobs that always run will always post a status context on GitHub to the commit under test, unless the job is configured with `skip_report: true`.
-Jobs that run conditionally but do not match the content of the pull request will _not_ post "Skipped" status contexts to the pull request.
-<!--- TODO(skuznets|fejta): remove mention of negative behavior by July --->
+Presubmit and postsubmit jobs post a status context to the GitHub
+commit under test once they start, unless the job is configured
+with `skip_report: true`.
 
-If a conditional job matched a pull request at some point in the past, ran and failed
-it will post a failed status context to the pull request. If the conditional job still
-matches the pull request, a `/retest` or `/test job-name` will re-trigger it and
-potentially update the failed context to passing. If the job no longer matches the pull
-request, you may still re-trigger it with `/test job-name`, but if it is no longer
-relevant to the pull request, use the `/skip` command to dismiss the status context on
-GitHub.
+Use a `/retest` or `/test job-name` to re-trigger the test and
+hopefully update the failed context to passing.
+
+If a job should no longer trigger on the pull request, use the
+`/skip` command to dismiss a failing status context (depends on
+`skip` plugin).
+
+Repo administrators can also `/override job-name` in case of emergency
+(depends on the `override` plugin).
 
 ### Requiring Job Statuses
 #### Requiring Jobs for Auto-Merge Through Tide
@@ -190,10 +276,32 @@ The branch protection rules will only enforce the presence of jobs that run unco
 and have required status contexts. As conditionally-run jobs may or may not post a status
 context to GitHub, they cannot be required through this mechanism.
 
+## Running a ProwJob in a Build Cluster
+
+ProwJobs that execute as Kubernetes resources (namely `agent: kubernetes` jobs that run as Pods, the default value) can specify a `cluster: build-cluster-name` field as part of the ProwJob config to specify that the job should be run in a build cluster other than the default build cluster.
+
+```yaml
+periodics:
+- name: periodic-cluster-a
+  cluster: cluster-a
+  ...
+presubmits:
+  org/repo:
+  - name: presubmit-cluster-b
+    cluster: cluster-b
+    ...
+postsubmits:
+  org/repo:
+  - name: postsubmit-default-cluster
+    # cluster field omitted or set to "default"
+    ...
+```
+
+You can learn more about creating and using build clusters in [`scaling.md`](scaling.md#separate-build-clusters) and [`getting_started_deploy.md`](getting_started_deploy.md#Run-test-pods-in-different-clusters).
+
 ## Pod Utilities
 
 If you are adding a new job that will execute on a Kubernetes cluster (`agent: kubernetes`, the default value) you should consider using the [Pod Utilities](/prow/pod-utilities.md). The pod utils decorate jobs with additional containers that transparently provide source code checkout and log/metadata/artifact uploading to GCS.
-
 
 ## Job Environment Variables
 
@@ -202,20 +310,22 @@ runs on Kubernetes, the variables will be injected into every container in
 your pod, If the job is run in Jenkins, Prow will supply them as parameters to
 the build.
 
-Variable | Periodic | Postsubmit | Batch | Presubmit | Description | Example
---- |:---:|:---:|:---:|:---:| --- | ---
-`JOB_NAME` | ✓ | ✓ | ✓ | ✓ | Name of the job. | `pull-test-infra-bazel`
-`JOB_TYPE` | ✓ | ✓ | ✓ | ✓ | Type of job. | `presubmit`
-`JOB_SPEC` | ✓ | ✓ | ✓ | ✓ | JSON-encoded job specification. | see below
-`BUILD_ID` | ✓ | ✓ | ✓ | ✓ | Unique build number for each run. | `12345`
-`PROW_JOB_ID` | ✓ | ✓ | ✓ | ✓ | Unique identifier for the owning Prow Job. | `1ce07fa2-0831-11e8-b07e-0a58ac101036`
-`REPO_OWNER` | | ✓ | ✓ | ✓ | GitHub org that triggered the job. | `kubernetes`
-`REPO_NAME` | | ✓ | ✓ | ✓ | GitHub repo that triggered the job. | `test-infra`
-`PULL_BASE_REF` | | ✓ | ✓ | ✓ | Ref name of the base branch. | `master`
-`PULL_BASE_SHA` | | ✓ | ✓ | ✓ | Git SHA of the base branch. | `123abc`
-`PULL_REFS` | | ✓ | ✓ | ✓ | All refs to test. | `master:123abc,5:qwe456`
-`PULL_NUMBER` | | | | ✓ | Pull request number. | `5`
-`PULL_PULL_SHA` | | | | ✓ | Pull request head SHA. | `qwe456`
+| Variable        | Periodic | Postsubmit | Batch | Presubmit | Description                                                             | Example                                |
+| --------------- | :------: | :--------: | :---: | :-------: | ----------------------------------------------------------------------- | -------------------------------------- |
+| `CI`            |    ✓     |     ✓      |   ✓   |     ✓     | Represents whether the current environment is a CI environment          | `true`                                 |
+| `ARTIFACTS`     |    ✓     |     ✓      |   ✓   |     ✓     | Directory in which to place files to be uploaded when the job completes | `/logs/artifacts`                      |
+| `JOB_NAME`      |    ✓     |     ✓      |   ✓   |     ✓     | Name of the job.                                                        | `pull-test-infra-bazel`                |
+| `JOB_TYPE`      |    ✓     |     ✓      |   ✓   |     ✓     | Type of job.                                                            | `presubmit`                            |
+| `JOB_SPEC`      |    ✓     |     ✓      |   ✓   |     ✓     | JSON-encoded job specification.                                         | see below                              |
+| `BUILD_ID`      |    ✓     |     ✓      |   ✓   |     ✓     | Unique build number for each run.                                       | `12345`                                |
+| `PROW_JOB_ID`   |    ✓     |     ✓      |   ✓   |     ✓     | Unique identifier for the owning Prow Job.                              | `1ce07fa2-0831-11e8-b07e-0a58ac101036` |
+| `REPO_OWNER`    |          |     ✓      |   ✓   |     ✓     | GitHub org that triggered the job.                                      | `kubernetes`                           |
+| `REPO_NAME`     |          |     ✓      |   ✓   |     ✓     | GitHub repo that triggered the job.                                     | `test-infra`                           |
+| `PULL_BASE_REF` |          |     ✓      |   ✓   |     ✓     | Ref name of the base branch.                                            | `master`                               |
+| `PULL_BASE_SHA` |          |     ✓      |   ✓   |     ✓     | Git SHA of the base branch.                                             | `123abc`                               |
+| `PULL_REFS`     |          |     ✓      |   ✓   |     ✓     | All refs to test.                                                       | `master:123abc,5:qwe456`               |
+| `PULL_NUMBER`   |          |            |       |     ✓     | Pull request number.                                                    | `5`                                    |
+| `PULL_PULL_SHA` |          |            |       |     ✓     | Pull request head SHA.                                                  | `qwe456`                               |
 
 Examples of the JSON-encoded job specification follow for the different
 job types:
@@ -244,5 +354,18 @@ Batch Job:
 
 See ["How to test a ProwJob"](/prow/build_test_update.md#How-to-test-a-ProwJob).
 
-[`Presets`]: https://github.com/kubernetes/test-infra/blob/3afb608d28630b99e49e09dd101a96c201268739/prow/config/jobs.go#L33-L40
+## Badges
+
+Prow can display badges that signal whether jobs are passing ([example](https://prow.k8s.io/badge.svg?jobs=post-test-infra-bazel)).
+
+The format to send your `deck` URL is `/badge.svg?jobs=single-job-name` or `/badge.svg?jobs=common-job-prefix-*`.
+
+<!-- links -->
+
+[Pod overview]: https://kubernetes.io/docs/concepts/workloads/pods/pod-overview/#pod-templates
 [PodPresets]: https://kubernetes.io/docs/concepts/workloads/pods/podpreset/
+[PodSpec api reference]: https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.16/#podspec-v1-core
+[`Presets`]: https://github.com/kubernetes/test-infra/blob/3afb608d28630b99e49e09dd101a96c201268739/prow/config/jobs.go#L33-L40
+[`plugins.yaml`]: /config/prow/plugins.yaml
+[deployed]: https://github.com/kubernetes/test-infra/blob/master/prow/getting_started_deploy.md
+[regular expression]: https://golang.org/pkg/regexp/syntax/

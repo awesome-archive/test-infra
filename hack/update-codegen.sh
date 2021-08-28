@@ -35,7 +35,17 @@ clientgen=$PWD/$1
 deepcopygen=$PWD/$2
 informergen=$PWD/$3
 listergen=$PWD/$4
-do_clean=${5:-}
+go_bindata=$PWD/$5
+do_clean=${6:-}
+
+# Ensure correct go binary is on path
+PATH=$go_sdk/bin:${PATH:-}
+
+cleanup() {
+  if [[ -n ${fake_gopath:-} ]]; then chmod u+rwx -R $fake_gopath && rm -rf $fake_gopath; fi
+  if [[ -n ${TEMP_GOCACHE:-} ]]; then rm -rf $TEMP_GOCACHE; fi
+}
+trap cleanup EXIT
 
 ensure-in-gopath() {
   fake_gopath=$(mktemp -d -t codegen.gopath.XXXX)
@@ -53,6 +63,21 @@ ensure-in-gopath() {
   cd "$fake_repopath"
 }
 
+# copyfiles will copy all files in 'path' in the fake gopath over to the
+# workspace directory as the code generators output directly into GOPATH,
+# meaning without this function the generated files are left in /tmp
+copyfiles() {
+  path=$1
+  name=$2
+  if [[ ! -d "$path" ]]; then
+    return 0
+  fi
+  (
+    cd "$GOPATH/src/k8s.io/test-infra/$path"
+    find "." -name "$name" -exec cp {} "$BUILD_WORKSPACE_DIRECTORY/$path/{}" \;
+  )
+}
+
 # clean will delete files matching name in path.
 #
 # When inside bazel test the files are read-only.
@@ -65,6 +90,7 @@ clean() {
     return 0
   fi
   find "$path" -name "$name" -delete
+  find "$BUILD_WORKSPACE_DIRECTORY"/"$path" -name "$name" -delete
 }
 
 gen-deepcopy() {
@@ -75,6 +101,7 @@ gen-deepcopy() {
     --input-dirs k8s.io/test-infra/prow/apis/prowjobs/v1 \
     --output-file-base zz_generated.deepcopy \
     --bounding-dirs k8s.io/test-infra/prow/apis
+  copyfiles "prow/apis" "zz_generated.deepcopy.go"
 }
 
 gen-client() {
@@ -86,6 +113,17 @@ gen-client() {
     --input-base "" \
     --input k8s.io/test-infra/prow/apis/prowjobs/v1 \
     --output-package k8s.io/test-infra/prow/client/clientset
+  copyfiles "./prow/client/clientset" "*.go"
+
+  clean prow/pipeline/clientset '*.go'
+  echo "Generating client for pipeline..." >&2
+  "$clientgen" \
+    --go-header-file hack/boilerplate/boilerplate.generated.go.txt \
+    --clientset-name versioned \
+    --input-base "" \
+    --input github.com/tektoncd/pipeline/pkg/apis/pipeline/v1alpha1 \
+    --output-package k8s.io/test-infra/prow/pipeline/clientset
+  copyfiles "./prow/pipeline/clientset" "*.go"
 }
 
 gen-lister() {
@@ -95,6 +133,15 @@ gen-lister() {
     --go-header-file hack/boilerplate/boilerplate.generated.go.txt \
     --input-dirs k8s.io/test-infra/prow/apis/prowjobs/v1 \
     --output-package k8s.io/test-infra/prow/client/listers
+  copyfiles "./prow/client/listers" "*.go"
+
+  clean prow/pipeline/listers '*.go'
+  echo "Generating lister for pipeline..." >&2
+  "$listergen" \
+    --go-header-file hack/boilerplate/boilerplate.generated.go.txt \
+    --input-dirs github.com/tektoncd/pipeline/pkg/apis/pipeline/v1alpha1 \
+    --output-package k8s.io/test-infra/prow/pipeline/listers
+  copyfiles "./prow/pipeline/listers" "*.go"
 }
 
 gen-informer() {
@@ -106,12 +153,31 @@ gen-informer() {
     --versioned-clientset-package k8s.io/test-infra/prow/client/clientset/versioned \
     --listers-package k8s.io/test-infra/prow/client/listers \
     --output-package k8s.io/test-infra/prow/client/informers
+  copyfiles "./prow/client/informers" "*.go"
+
+  clean prow/pipeline/informers '*.go'
+  echo "Generating informer for pipeline..." >&2
+  "$informergen" \
+    --go-header-file hack/boilerplate/boilerplate.generated.go.txt \
+    --input-dirs github.com/tektoncd/pipeline/pkg/apis/pipeline/v1alpha1 \
+    --versioned-clientset-package k8s.io/test-infra/prow/pipeline/clientset/versioned \
+    --listers-package k8s.io/test-infra/prow/pipeline/listers \
+    --output-package k8s.io/test-infra/prow/pipeline/informers
+  copyfiles "./prow/pipeline/informers" "*.go"
+}
+
+gen-spyglass-bindata(){
+  cd prow/spyglass/lenses/common/
+  $go_bindata -pkg=common static/
+  "$go_sdk/bin/gofmt" -s -w ./
+  cd -
 }
 
 export GO111MODULE=off
 ensure-in-gopath
 old=${GOCACHE:-}
-export GOCACHE=$(mktemp -d -t codegen.gocache.XXXX)
+export TEMP_GOCACHE=$(mktemp -d -t codegen.gocache.XXXX)
+export GOCACHE=$TEMP_GOCACHE
 export GO111MODULE=on
 export GOPROXY=https://proxy.golang.org
 export GOSUMDB=sum.golang.org
@@ -122,4 +188,5 @@ gen-deepcopy
 gen-client
 gen-lister
 gen-informer
+gen-spyglass-bindata
 export GO111MODULE=on

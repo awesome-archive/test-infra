@@ -17,29 +17,19 @@ limitations under the License.
 package pjutil
 
 import (
+	"context"
+	"reflect"
 	"testing"
 	"time"
 
 	"github.com/sirupsen/logrus"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/sets"
-	prowjobv1 "k8s.io/test-infra/prow/apis/prowjobs/v1"
+	fakectrlruntimeclient "sigs.k8s.io/controller-runtime/pkg/client/fake"
+
+	prowv1 "k8s.io/test-infra/prow/apis/prowjobs/v1"
 )
-
-type fakeProwClient struct {
-	replacedJobs map[string]*prowjobv1.ProwJob
-}
-
-func newFakeProwClient() *fakeProwClient {
-	return &fakeProwClient{
-		replacedJobs: map[string]*prowjobv1.ProwJob{},
-	}
-}
-
-func (c *fakeProwClient) Update(pj *prowjobv1.ProwJob) (*prowjobv1.ProwJob, error) {
-	c.replacedJobs[pj.Name] = pj.DeepCopy()
-	return pj, nil
-}
 
 func TestTerminateOlderJobs(t *testing.T) {
 	fakePJNS := "prow-job"
@@ -49,430 +39,443 @@ func TestTerminateOlderJobs(t *testing.T) {
 		return &reallyNow
 	}
 	cases := []struct {
-		name           string
-		pjs            []prowjobv1.ProwJob
-		terminateddPJs sets.String
+		name               string
+		pjs                []prowv1.ProwJob
+		expectedAbortedPJs sets.String
 	}{
 		{
 			name: "terminate all older presubmit jobs",
-			pjs: []prowjobv1.ProwJob{
+			pjs: []prowv1.ProwJob{
 				{
 					ObjectMeta: metav1.ObjectMeta{Name: "newest", Namespace: fakePJNS},
-					Spec: prowjobv1.ProwJobSpec{
-						Type: prowjobv1.PresubmitJob,
+					Spec: prowv1.ProwJobSpec{
+						Type: prowv1.PresubmitJob,
 						Job:  "j1",
-						Refs: &prowjobv1.Refs{
+						Refs: &prowv1.Refs{
 							Repo:  "test",
-							Pulls: []prowjobv1.Pull{{Number: 1}},
+							Pulls: []prowv1.Pull{{Number: 1}},
 						},
 					},
-					Status: prowjobv1.ProwJobStatus{
+					Status: prowv1.ProwJobStatus{
 						StartTime: metav1.NewTime(now.Add(-time.Minute)),
 					},
 				},
 				{
 					ObjectMeta: metav1.ObjectMeta{Name: "old", Namespace: fakePJNS},
-					Spec: prowjobv1.ProwJobSpec{
-						Type: prowjobv1.PresubmitJob,
+					Spec: prowv1.ProwJobSpec{
+						Type: prowv1.PresubmitJob,
 						Job:  "j1",
-						Refs: &prowjobv1.Refs{
+						Refs: &prowv1.Refs{
 							Repo:  "test",
-							Pulls: []prowjobv1.Pull{{Number: 1}},
+							Pulls: []prowv1.Pull{{Number: 1}},
 						},
 					},
-					Status: prowjobv1.ProwJobStatus{
+					Status: prowv1.ProwJobStatus{
 						StartTime: metav1.NewTime(now.Add(-time.Hour)),
 					},
 				},
 				{
 					ObjectMeta: metav1.ObjectMeta{Name: "older", Namespace: fakePJNS},
-					Spec: prowjobv1.ProwJobSpec{
-						Type: prowjobv1.PresubmitJob,
+					Spec: prowv1.ProwJobSpec{
+						Type: prowv1.PresubmitJob,
 						Job:  "j1",
-						Refs: &prowjobv1.Refs{
+						Refs: &prowv1.Refs{
 							Repo:  "test",
-							Pulls: []prowjobv1.Pull{{Number: 1}},
+							Pulls: []prowv1.Pull{{Number: 1}},
 						},
 					},
-					Status: prowjobv1.ProwJobStatus{
+					Status: prowv1.ProwJobStatus{
 						StartTime: metav1.NewTime(now.Add(-2 * time.Hour)),
 					},
 				},
 				{
 					ObjectMeta: metav1.ObjectMeta{Name: "postsubmit", Namespace: fakePJNS},
-					Spec: prowjobv1.ProwJobSpec{
-						Type: prowjobv1.PostsubmitJob,
+					Spec: prowv1.ProwJobSpec{
+						Type: prowv1.PostsubmitJob,
 						Job:  "j1",
-						Refs: &prowjobv1.Refs{
+						Refs: &prowv1.Refs{
 							Repo:  "test",
-							Pulls: []prowjobv1.Pull{{Number: 1}},
+							Pulls: []prowv1.Pull{{Number: 1}},
 						},
 					},
-					Status: prowjobv1.ProwJobStatus{
+					Status: prowv1.ProwJobStatus{
 						StartTime: metav1.NewTime(now.Add(-2 * time.Hour)),
 					},
 				},
 				{
 					ObjectMeta: metav1.ObjectMeta{Name: "completed", Namespace: fakePJNS},
-					Spec: prowjobv1.ProwJobSpec{
-						Type: prowjobv1.PresubmitJob,
+					Spec: prowv1.ProwJobSpec{
+						Type: prowv1.PresubmitJob,
 						Job:  "j1",
-						Refs: &prowjobv1.Refs{
+						Refs: &prowv1.Refs{
 							Repo:  "test",
-							Pulls: []prowjobv1.Pull{{Number: 1}},
+							Pulls: []prowv1.Pull{{Number: 1}},
 						},
 					},
-					Status: prowjobv1.ProwJobStatus{
+					Status: prowv1.ProwJobStatus{
 						StartTime:      metav1.NewTime(now.Add(-2 * time.Hour)),
 						CompletionTime: nowFn(),
 					},
 				},
 			},
-			terminateddPJs: sets.NewString("old", "older"),
+			expectedAbortedPJs: sets.NewString("old", "older"),
 		},
 		{
-			name: "terminate all older batch jobs",
-			pjs: []prowjobv1.ProwJob{
+			name: "Don't terminate older batch jobs",
+			pjs: []prowv1.ProwJob{
 				{
 					ObjectMeta: metav1.ObjectMeta{Name: "newest", Namespace: fakePJNS},
-					Spec: prowjobv1.ProwJobSpec{
-						Type: prowjobv1.BatchJob,
+					Spec: prowv1.ProwJobSpec{
+						Type: prowv1.BatchJob,
 						Job:  "j1",
-						Refs: &prowjobv1.Refs{
+						Refs: &prowv1.Refs{
 							Repo:  "test",
-							Pulls: []prowjobv1.Pull{{Number: 1}},
+							Pulls: []prowv1.Pull{{Number: 1}},
 						},
 					},
-					Status: prowjobv1.ProwJobStatus{
+					Status: prowv1.ProwJobStatus{
 						StartTime: metav1.NewTime(now.Add(-time.Minute)),
 					},
 				},
 				{
 					ObjectMeta: metav1.ObjectMeta{Name: "old", Namespace: fakePJNS},
-					Spec: prowjobv1.ProwJobSpec{
-						Type: prowjobv1.BatchJob,
+					Spec: prowv1.ProwJobSpec{
+						Type: prowv1.BatchJob,
 						Job:  "j1",
-						Refs: &prowjobv1.Refs{
+						Refs: &prowv1.Refs{
 							Repo:  "test",
-							Pulls: []prowjobv1.Pull{{Number: 1}},
+							Pulls: []prowv1.Pull{{Number: 1}},
 						},
 					},
-					Status: prowjobv1.ProwJobStatus{
+					Status: prowv1.ProwJobStatus{
 						StartTime: metav1.NewTime(now.Add(-time.Hour)),
 					},
 				},
 				{
 					ObjectMeta: metav1.ObjectMeta{Name: "older", Namespace: fakePJNS},
-					Spec: prowjobv1.ProwJobSpec{
-						Type: prowjobv1.BatchJob,
+					Spec: prowv1.ProwJobSpec{
+						Type: prowv1.BatchJob,
 						Job:  "j1",
-						Refs: &prowjobv1.Refs{
+						Refs: &prowv1.Refs{
 							Repo:  "test",
-							Pulls: []prowjobv1.Pull{{Number: 1}},
+							Pulls: []prowv1.Pull{{Number: 1}},
 						},
 					},
-					Status: prowjobv1.ProwJobStatus{
+					Status: prowv1.ProwJobStatus{
 						StartTime: metav1.NewTime(now.Add(-2 * time.Hour)),
 					},
 				},
 				{
 					ObjectMeta: metav1.ObjectMeta{Name: "postsubmit", Namespace: fakePJNS},
-					Spec: prowjobv1.ProwJobSpec{
-						Type: prowjobv1.PostsubmitJob,
+					Spec: prowv1.ProwJobSpec{
+						Type: prowv1.PostsubmitJob,
 						Job:  "j1",
-						Refs: &prowjobv1.Refs{
+						Refs: &prowv1.Refs{
 							Repo:  "test",
-							Pulls: []prowjobv1.Pull{{Number: 1}},
+							Pulls: []prowv1.Pull{{Number: 1}},
 						},
 					},
-					Status: prowjobv1.ProwJobStatus{
+					Status: prowv1.ProwJobStatus{
 						StartTime: metav1.NewTime(now.Add(-2 * time.Hour)),
 					},
 				},
 				{
 					ObjectMeta: metav1.ObjectMeta{Name: "completed", Namespace: fakePJNS},
-					Spec: prowjobv1.ProwJobSpec{
-						Type: prowjobv1.BatchJob,
+					Spec: prowv1.ProwJobSpec{
+						Type: prowv1.BatchJob,
 						Job:  "j1",
-						Refs: &prowjobv1.Refs{
+						Refs: &prowv1.Refs{
 							Repo:  "test",
-							Pulls: []prowjobv1.Pull{{Number: 1}},
+							Pulls: []prowv1.Pull{{Number: 1}},
 						},
 					},
-					Status: prowjobv1.ProwJobStatus{
+					Status: prowv1.ProwJobStatus{
 						StartTime:      metav1.NewTime(now.Add(-2 * time.Hour)),
 						CompletionTime: nowFn(),
 					},
 				},
 			},
-			terminateddPJs: sets.NewString("old", "older"),
+			expectedAbortedPJs: sets.NewString(),
 		},
 		{
 			name: "terminate older jobs with different orders of refs",
-			pjs: []prowjobv1.ProwJob{
+			pjs: []prowv1.ProwJob{
 				{
 					ObjectMeta: metav1.ObjectMeta{Name: "newest", Namespace: fakePJNS},
-					Spec: prowjobv1.ProwJobSpec{
-						Type: prowjobv1.BatchJob,
+					Spec: prowv1.ProwJobSpec{
+						Type: prowv1.PresubmitJob,
 						Job:  "j1",
-						Refs: &prowjobv1.Refs{
+						Refs: &prowv1.Refs{
 							Repo:  "test",
-							Pulls: []prowjobv1.Pull{{Number: 1}, {Number: 2}},
+							Pulls: []prowv1.Pull{{Number: 1}, {Number: 2}},
 						},
 					},
-					Status: prowjobv1.ProwJobStatus{
+					Status: prowv1.ProwJobStatus{
 						StartTime: metav1.NewTime(now.Add(-time.Minute)),
 					},
 				},
 				{
 					ObjectMeta: metav1.ObjectMeta{Name: "old", Namespace: fakePJNS},
-					Spec: prowjobv1.ProwJobSpec{
-						Type: prowjobv1.BatchJob,
+					Spec: prowv1.ProwJobSpec{
+						Type: prowv1.PresubmitJob,
 						Job:  "j1",
-						Refs: &prowjobv1.Refs{
+						Refs: &prowv1.Refs{
 							Repo:  "test",
-							Pulls: []prowjobv1.Pull{{Number: 2}, {Number: 1}},
+							Pulls: []prowv1.Pull{{Number: 2}, {Number: 1}},
 						},
 					},
-					Status: prowjobv1.ProwJobStatus{
+					Status: prowv1.ProwJobStatus{
 						StartTime: metav1.NewTime(now.Add(-time.Minute)),
 					},
 				},
 			},
-			terminateddPJs: sets.NewString("old"),
+			expectedAbortedPJs: sets.NewString("old"),
 		},
 		{
 			name: "terminate older jobs with different orders of extra refs",
-			pjs: []prowjobv1.ProwJob{
+			pjs: []prowv1.ProwJob{
 				{
 					ObjectMeta: metav1.ObjectMeta{Name: "newest", Namespace: fakePJNS},
-					Spec: prowjobv1.ProwJobSpec{
-						Type: prowjobv1.BatchJob,
+					Spec: prowv1.ProwJobSpec{
+						Type: prowv1.PresubmitJob,
 						Job:  "j1",
-						Refs: &prowjobv1.Refs{
+						Refs: &prowv1.Refs{
 							Repo:  "test",
-							Pulls: []prowjobv1.Pull{{Number: 1}},
+							Pulls: []prowv1.Pull{{Number: 1}},
 						},
-						ExtraRefs: []prowjobv1.Refs{
+						ExtraRefs: []prowv1.Refs{
 							{
 								Repo:  "other",
-								Pulls: []prowjobv1.Pull{{Number: 2}},
+								Pulls: []prowv1.Pull{{Number: 2}},
 							},
 							{
 								Repo:  "something",
-								Pulls: []prowjobv1.Pull{{Number: 3}},
+								Pulls: []prowv1.Pull{{Number: 3}},
 							},
 						},
 					},
-					Status: prowjobv1.ProwJobStatus{
+					Status: prowv1.ProwJobStatus{
 						StartTime: metav1.NewTime(now.Add(-time.Minute)),
 					},
 				},
 				{
 					ObjectMeta: metav1.ObjectMeta{Name: "old", Namespace: fakePJNS},
-					Spec: prowjobv1.ProwJobSpec{
-						Type: prowjobv1.BatchJob,
+					Spec: prowv1.ProwJobSpec{
+						Type: prowv1.PresubmitJob,
 						Job:  "j1",
-						Refs: &prowjobv1.Refs{
+						Refs: &prowv1.Refs{
 							Repo:  "test",
-							Pulls: []prowjobv1.Pull{{Number: 1}},
+							Pulls: []prowv1.Pull{{Number: 1}},
 						},
-						ExtraRefs: []prowjobv1.Refs{
+						ExtraRefs: []prowv1.Refs{
 							{
 								Repo:  "something",
-								Pulls: []prowjobv1.Pull{{Number: 3}},
+								Pulls: []prowv1.Pull{{Number: 3}},
 							},
 							{
 								Repo:  "other",
-								Pulls: []prowjobv1.Pull{{Number: 2}},
+								Pulls: []prowv1.Pull{{Number: 2}},
 							},
 						},
 					},
-					Status: prowjobv1.ProwJobStatus{
+					Status: prowv1.ProwJobStatus{
 						StartTime: metav1.NewTime(now.Add(-time.Minute)),
 					},
 				},
 			},
-			terminateddPJs: sets.NewString("old"),
+			expectedAbortedPJs: sets.NewString("old"),
 		},
 		{
 			name: "terminate older jobs with no main refs, only extra refs",
-			pjs: []prowjobv1.ProwJob{
+			pjs: []prowv1.ProwJob{
 				{
 					ObjectMeta: metav1.ObjectMeta{Name: "newest", Namespace: fakePJNS},
-					Spec: prowjobv1.ProwJobSpec{
-						Type: prowjobv1.BatchJob,
+					Spec: prowv1.ProwJobSpec{
+						Type: prowv1.PresubmitJob,
 						Job:  "j1",
-						ExtraRefs: []prowjobv1.Refs{
+						ExtraRefs: []prowv1.Refs{
 							{
 								Repo:  "test",
-								Pulls: []prowjobv1.Pull{{Number: 1}},
+								Pulls: []prowv1.Pull{{Number: 1}},
 							},
 						},
 					},
-					Status: prowjobv1.ProwJobStatus{
+					Status: prowv1.ProwJobStatus{
 						StartTime: metav1.NewTime(now.Add(-time.Minute)),
 					},
 				},
 				{
 					ObjectMeta: metav1.ObjectMeta{Name: "old", Namespace: fakePJNS},
-					Spec: prowjobv1.ProwJobSpec{
-						Type: prowjobv1.BatchJob,
+					Spec: prowv1.ProwJobSpec{
+						Type: prowv1.PresubmitJob,
 						Job:  "j1",
-						ExtraRefs: []prowjobv1.Refs{
+						ExtraRefs: []prowv1.Refs{
 							{
 								Repo:  "test",
-								Pulls: []prowjobv1.Pull{{Number: 1}},
+								Pulls: []prowv1.Pull{{Number: 1}},
 							},
 						},
 					},
-					Status: prowjobv1.ProwJobStatus{
+					Status: prowv1.ProwJobStatus{
 						StartTime: metav1.NewTime(now.Add(-time.Minute)),
 					},
 				},
 			},
-			terminateddPJs: sets.NewString("old"),
+			expectedAbortedPJs: sets.NewString("old"),
 		},
 		{
 			name: "terminate older jobs with different base SHA",
-			pjs: []prowjobv1.ProwJob{
+			pjs: []prowv1.ProwJob{
 				{
 					ObjectMeta: metav1.ObjectMeta{Name: "newest", Namespace: fakePJNS},
-					Spec: prowjobv1.ProwJobSpec{
-						Type: prowjobv1.BatchJob,
+					Spec: prowv1.ProwJobSpec{
+						Type: prowv1.PresubmitJob,
 						Job:  "j1",
-						Refs: &prowjobv1.Refs{
+						Refs: &prowv1.Refs{
 							Repo:    "test",
 							BaseSHA: "foo",
-							Pulls:   []prowjobv1.Pull{{Number: 1}},
+							Pulls:   []prowv1.Pull{{Number: 1}},
 						},
 					},
-					Status: prowjobv1.ProwJobStatus{
+					Status: prowv1.ProwJobStatus{
 						StartTime: metav1.NewTime(now.Add(-time.Minute)),
 					},
 				},
 				{
 					ObjectMeta: metav1.ObjectMeta{Name: "old", Namespace: fakePJNS},
-					Spec: prowjobv1.ProwJobSpec{
-						Type: prowjobv1.BatchJob,
+					Spec: prowv1.ProwJobSpec{
+						Type: prowv1.PresubmitJob,
 						Job:  "j1",
-						Refs: &prowjobv1.Refs{
+						Refs: &prowv1.Refs{
 							Repo:    "test",
 							BaseSHA: "bar",
-							Pulls:   []prowjobv1.Pull{{Number: 1}},
+							Pulls:   []prowv1.Pull{{Number: 1}},
 						},
 					},
-					Status: prowjobv1.ProwJobStatus{
+					Status: prowv1.ProwJobStatus{
 						StartTime: metav1.NewTime(now.Add(-time.Minute)),
 					},
 				},
 			},
-			terminateddPJs: sets.NewString("old"),
+			expectedAbortedPJs: sets.NewString("old"),
 		},
 		{
 			name: "don't terminate older jobs with different base refs",
-			pjs: []prowjobv1.ProwJob{
+			pjs: []prowv1.ProwJob{
 				{
 					ObjectMeta: metav1.ObjectMeta{Name: "newest", Namespace: fakePJNS},
-					Spec: prowjobv1.ProwJobSpec{
-						Type: prowjobv1.BatchJob,
+					Spec: prowv1.ProwJobSpec{
+						Type: prowv1.PresubmitJob,
 						Job:  "j1",
-						Refs: &prowjobv1.Refs{
+						Refs: &prowv1.Refs{
 							Repo:    "test",
 							BaseRef: "foo",
-							Pulls:   []prowjobv1.Pull{{Number: 1}},
+							Pulls:   []prowv1.Pull{{Number: 1}},
 						},
 					},
-					Status: prowjobv1.ProwJobStatus{
+					Status: prowv1.ProwJobStatus{
 						StartTime: metav1.NewTime(now.Add(-time.Minute)),
 					},
 				},
 				{
 					ObjectMeta: metav1.ObjectMeta{Name: "old", Namespace: fakePJNS},
-					Spec: prowjobv1.ProwJobSpec{
-						Type: prowjobv1.BatchJob,
+					Spec: prowv1.ProwJobSpec{
+						Type: prowv1.PresubmitJob,
 						Job:  "j1",
-						Refs: &prowjobv1.Refs{
+						Refs: &prowv1.Refs{
 							Repo:    "test",
 							BaseRef: "bar",
-							Pulls:   []prowjobv1.Pull{{Number: 1}},
+							Pulls:   []prowv1.Pull{{Number: 1}},
 						},
 					},
-					Status: prowjobv1.ProwJobStatus{
+					Status: prowv1.ProwJobStatus{
 						StartTime: metav1.NewTime(now.Add(-time.Minute)),
 					},
 				},
 			},
-			terminateddPJs: sets.NewString(),
+			expectedAbortedPJs: sets.NewString(),
 		},
 		{
 			name: "terminate older jobs with different pull sha",
-			pjs: []prowjobv1.ProwJob{
+			pjs: []prowv1.ProwJob{
 				{
 					ObjectMeta: metav1.ObjectMeta{Name: "newest", Namespace: fakePJNS},
-					Spec: prowjobv1.ProwJobSpec{
-						Type: prowjobv1.BatchJob,
+					Spec: prowv1.ProwJobSpec{
+						Type: prowv1.PresubmitJob,
 						Job:  "j1",
-						Refs: &prowjobv1.Refs{
+						Refs: &prowv1.Refs{
 							Repo:  "test",
-							Pulls: []prowjobv1.Pull{{Number: 1, SHA: "foo"}},
+							Pulls: []prowv1.Pull{{Number: 1, SHA: "foo"}},
 						},
 					},
-					Status: prowjobv1.ProwJobStatus{
+					Status: prowv1.ProwJobStatus{
 						StartTime: metav1.NewTime(now.Add(-time.Minute)),
 					},
 				},
 				{
 					ObjectMeta: metav1.ObjectMeta{Name: "old", Namespace: fakePJNS},
-					Spec: prowjobv1.ProwJobSpec{
-						Type: prowjobv1.BatchJob,
+					Spec: prowv1.ProwJobSpec{
+						Type: prowv1.PresubmitJob,
 						Job:  "j1",
-						Refs: &prowjobv1.Refs{
+						Refs: &prowv1.Refs{
 							Repo:  "test",
-							Pulls: []prowjobv1.Pull{{Number: 1, SHA: "bar"}},
+							Pulls: []prowv1.Pull{{Number: 1, SHA: "bar"}},
 						},
 					},
-					Status: prowjobv1.ProwJobStatus{
+					Status: prowv1.ProwJobStatus{
 						StartTime: metav1.NewTime(now.Add(-time.Minute)),
 					},
 				},
 			},
-			terminateddPJs: sets.NewString("old"),
+			expectedAbortedPJs: sets.NewString("old"),
 		},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			pjc := newFakeProwClient()
+			var clientPJs []runtime.Object
+			var origPJs []prowv1.ProwJob
+			for i := range tc.pjs {
+				clientPJs = append(clientPJs, &tc.pjs[i])
+				origPJs = append(origPJs, tc.pjs[i])
+			}
+			fakeProwJobClient := fakectrlruntimeclient.NewFakeClient(clientPJs...)
 			log := logrus.NewEntry(logrus.StandardLogger())
-			cleanedupPJs := sets.NewString()
-			err := TerminateOlderJobs(pjc, log, tc.pjs, func(pj prowjobv1.ProwJob) error {
-				cleanedupPJs.Insert(pj.GetName())
-				return nil
-			})
-			if err != nil {
+			if err := TerminateOlderJobs(fakeProwJobClient, log, tc.pjs); err != nil {
 				t.Fatalf("%s: error terminating the older presubmit jobs: %v", tc.name, err)
 			}
 
-			if missing := tc.terminateddPJs.Difference(cleanedupPJs); missing.Len() > 0 {
-				t.Errorf("%s: did not cleaned up the expected jobs: %v", tc.name, missing.List())
-			}
-			if extra := cleanedupPJs.Difference(tc.terminateddPJs); extra.Len() > 0 {
-				t.Errorf("%s: found unexpectedly cleaned up jobs: %v", tc.name, extra.List())
+			var actualPJs prowv1.ProwJobList
+			if err := fakeProwJobClient.List(context.Background(), &actualPJs); err != nil {
+				t.Fatalf("failed to list prowjobs: %v", err)
 			}
 
-			replacedJobs := sets.NewString()
-			for _, pj := range pjc.replacedJobs {
-				if pj.Status.State != prowjobv1.AbortedState {
-					t.Errorf("%s: did not aborted the prow job: name=%s, state=%s", tc.name, pj.GetName(), pj.Status.State)
+			actuallyAbortedJobs := sets.String{}
+			for _, job := range actualPJs.Items {
+				if job.Status.State == prowv1.AbortedState {
+					if job.Complete() {
+						t.Errorf("job %s was set to complete, TerminateOlderJobs must never set prowjobs as completed", job.Name)
+					}
+					actuallyAbortedJobs.Insert(job.Name)
 				}
-				replacedJobs.Insert(pj.GetName())
 			}
-			if missing := tc.terminateddPJs.Difference(replacedJobs); missing.Len() > 0 {
+
+			if missing := tc.expectedAbortedPJs.Difference(actuallyAbortedJobs); missing.Len() > 0 {
 				t.Errorf("%s: did not replace the expected jobs: %v", tc.name, missing.Len())
 			}
-			if extra := replacedJobs.Difference(tc.terminateddPJs); extra.Len() > 0 {
+			if extra := actuallyAbortedJobs.Difference(tc.expectedAbortedPJs); extra.Len() > 0 {
 				t.Errorf("%s: found unexpectedly replaced job: %v", tc.name, extra.List())
+			}
+
+			// Validate that terminated PJs are marked terminated in the passed slice.
+			// Only consider jobs that we expected to be replaced and that were replaced.
+			replacedAsExpected := actuallyAbortedJobs.Intersection(tc.expectedAbortedPJs)
+			for i := range origPJs {
+				if replacedAsExpected.Has(origPJs[i].Name) {
+					if reflect.DeepEqual(origPJs[i], tc.pjs[i]) {
+						t.Errorf("%s: job %q was terminated, but not updated in the slice", tc.name, origPJs[i].Name)
+					}
+				}
 			}
 		})
 	}

@@ -20,7 +20,7 @@ import (
 	"fmt"
 
 	"github.com/golang/glog"
-	"k8s.io/test-infra/prow/errorutil"
+	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 
 	"k8s.io/test-infra/prow/github"
 )
@@ -137,7 +137,7 @@ func retireAction(origContext, newContext, targetURL string) func(statuses []git
 	stateSuccess := "success"
 	var desc string
 	if newContext == "" {
-		desc = fmt.Sprint("Context retired without replacement.")
+		desc = "Context retired without replacement."
 	} else {
 		desc = fmt.Sprintf("Context retired. Status moved to \"%s\".", newContext)
 	}
@@ -265,5 +265,5 @@ func (m *Migrator) Migrate() error {
 			return err
 		}
 	}
-	return errorutil.NewAggregate(errors...)
+	return utilerrors.NewAggregate(errors)
 }

@@ -17,21 +17,29 @@ limitations under the License.
 package plugins
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"path"
+	"reflect"
 	"regexp"
 	"sort"
 	"strings"
-	"sync"
 	"time"
+
+	"sigs.k8s.io/yaml"
 
 	"github.com/sirupsen/logrus"
 
+	"github.com/google/go-cmp/cmp"
+	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/apimachinery/pkg/util/sets"
+
 	"k8s.io/test-infra/prow/bugzilla"
-	"k8s.io/test-infra/prow/errorutil"
+	"k8s.io/test-infra/prow/kube"
 	"k8s.io/test-infra/prow/labels"
+	"k8s.io/test-infra/prow/logrusutil"
+	"k8s.io/test-infra/prow/plugins/ownersconfig"
 )
 
 const (
@@ -42,10 +50,10 @@ const (
 type Configuration struct {
 	// Plugins is a map of repositories (eg "k/k") to lists of
 	// plugin names.
-	// You can find a comprehensive list of the default avaulable plugins here
+	// You can find a comprehensive list of the default available plugins here
 	// https://github.com/kubernetes/test-infra/tree/master/prow/plugins
 	// note that you're also able to add external plugins.
-	Plugins map[string][]string `json:"plugins,omitempty"`
+	Plugins Plugins `json:"plugins,omitempty"`
 
 	// ExternalPlugins is a map of repositories (eg "k/k") to lists of
 	// external plugins.
@@ -55,31 +63,45 @@ type Configuration struct {
 	Owners Owners `json:"owners,omitempty"`
 
 	// Built-in plugins specific configuration.
-	Approve                    []Approve                    `json:"approve,omitempty"`
-	UseDeprecatedSelfApprove   bool                         `json:"use_deprecated_2018_implicit_self_approve_default_migrate_before_july_2019,omitempty"`
-	UseDeprecatedReviewApprove bool                         `json:"use_deprecated_2018_review_acts_as_approve_default_migrate_before_july_2019,omitempty"`
-	Blockades                  []Blockade                   `json:"blockades,omitempty"`
-	Blunderbuss                Blunderbuss                  `json:"blunderbuss,omitempty"`
-	Bugzilla                   Bugzilla                     `json:"bugzilla"`
-	Cat                        Cat                          `json:"cat,omitempty"`
-	CherryPickUnapproved       CherryPickUnapproved         `json:"cherry_pick_unapproved,omitempty"`
-	ConfigUpdater              ConfigUpdater                `json:"config_updater,omitempty"`
-	Dco                        map[string]*Dco              `json:"dco,omitempty"`
-	Golint                     Golint                       `json:"golint"`
-	Heart                      Heart                        `json:"heart,omitempty"`
-	Label                      Label                        `json:"label"`
-	Lgtm                       []Lgtm                       `json:"lgtm,omitempty"`
-	MilestoneApplier           map[string]BranchToMilestone `json:"milestone_applier,omitempty"`
-	RepoMilestone              map[string]Milestone         `json:"repo_milestone,omitempty"`
-	Project                    ProjectConfig                `json:"project_config,omitempty"`
-	RequireMatchingLabel       []RequireMatchingLabel       `json:"require_matching_label,omitempty"`
-	RequireSIG                 RequireSIG                   `json:"requiresig,omitempty"`
-	Retitle                    Retitle                      `json:"retitle,omitempty"`
-	Slack                      Slack                        `json:"slack,omitempty"`
-	SigMention                 SigMention                   `json:"sigmention,omitempty"`
-	Size                       Size                         `json:"size"`
-	Triggers                   []Trigger                    `json:"triggers,omitempty"`
-	Welcome                    []Welcome                    `json:"welcome,omitempty"`
+	Approve              []Approve                    `json:"approve,omitempty"`
+	Blockades            []Blockade                   `json:"blockades,omitempty"`
+	Blunderbuss          Blunderbuss                  `json:"blunderbuss,omitempty"`
+	Bugzilla             Bugzilla                     `json:"bugzilla,omitempty"`
+	Cat                  Cat                          `json:"cat,omitempty"`
+	CherryPickUnapproved CherryPickUnapproved         `json:"cherry_pick_unapproved,omitempty"`
+	ConfigUpdater        ConfigUpdater                `json:"config_updater,omitempty"`
+	Dco                  map[string]*Dco              `json:"dco,omitempty"`
+	Golint               Golint                       `json:"golint,omitempty"`
+	Goose                Goose                        `json:"goose,omitempty"`
+	Heart                Heart                        `json:"heart,omitempty"`
+	Label                Label                        `json:"label,omitempty"`
+	Lgtm                 []Lgtm                       `json:"lgtm,omitempty"`
+	Jira                 *Jira                        `json:"jira,omitempty"`
+	MilestoneApplier     map[string]BranchToMilestone `json:"milestone_applier,omitempty"`
+	RepoMilestone        map[string]Milestone         `json:"repo_milestone,omitempty"`
+	Project              ProjectConfig                `json:"project_config,omitempty"`
+	ProjectManager       ProjectManager               `json:"project_manager,omitempty"`
+	RequireMatchingLabel []RequireMatchingLabel       `json:"require_matching_label,omitempty"`
+	Retitle              Retitle                      `json:"retitle,omitempty"`
+	Slack                Slack                        `json:"slack,omitempty"`
+	SigMention           SigMention                   `json:"sigmention,omitempty"`
+	Size                 Size                         `json:"size,omitempty"`
+	Triggers             []Trigger                    `json:"triggers,omitempty"`
+	Welcome              []Welcome                    `json:"welcome,omitempty"`
+	Override             Override                     `json:"override,omitempty"`
+	Help                 Help                         `json:"help,omitempty"`
+}
+
+type Help struct {
+	// HelpGuidelinesURL is the URL of the help page, which provides guidance on how and when to use the help wanted and good first issue labels.
+	// The default value is "https://git.k8s.io/community/contributors/guide/help-wanted.md".
+	HelpGuidelinesURL string `json:"help_guidelines_url,omitempty"`
+}
+
+func (h *Help) setDefaults() {
+	if h.HelpGuidelinesURL == "" {
+		h.HelpGuidelinesURL = "https://git.k8s.io/community/contributors/guide/help-wanted.md"
+	}
 }
 
 // Golint holds configuration for the golint plugin
@@ -88,6 +110,14 @@ type Golint struct {
 	// in (0,1] over which problems will be printed. Defaults to
 	// 0.8, as does the `go lint` tool.
 	MinimumConfidence *float64 `json:"minimum_confidence,omitempty"`
+}
+
+// Plugins maps orgOrRepo to plugins
+type Plugins map[string]OrgPlugins
+
+type OrgPlugins struct {
+	ExcludedRepos []string `json:"excluded_repos,omitempty"`
+	Plugins       []string `json:"plugins,omitempty"`
 }
 
 // ExternalPlugin holds configuration for registering an external
@@ -108,15 +138,10 @@ type ExternalPlugin struct {
 type Blunderbuss struct {
 	// ReviewerCount is the minimum number of reviewers to request
 	// reviews from. Defaults to requesting reviews from 2 reviewers
-	// if FileWeightCount is not set.
 	ReviewerCount *int `json:"request_count,omitempty"`
 	// MaxReviewerCount is the maximum number of reviewers to request
 	// reviews from. Defaults to 0 meaning no limit.
 	MaxReviewerCount int `json:"max_request_count,omitempty"`
-	// FileWeightCount is the maximum number of reviewers to request
-	// reviews from. Selects reviewers based on file weighting.
-	// This and request_count are mutually exclusive options.
-	FileWeightCount *int `json:"file_weight_count,omitempty"`
 	// ExcludeApprovers controls whether approvers are considered to be
 	// reviewers. By default, approvers are considered as reviewers if
 	// insufficient reviewers are available. If ExcludeApprovers is true,
@@ -151,10 +176,30 @@ type Owners struct {
 	// control in the provided repos.
 	SkipCollaborators []string `json:"skip_collaborators,omitempty"`
 
-	// LabelsBlackList holds a list of labels that should not be present in any
+	// LabelsDenyList holds a list of labels that should not be present in any
 	// OWNERS file, preventing their automatic addition by the owners-label plugin.
 	// This check is performed by the verify-owners plugin.
+	LabelsDenyList []string `json:"labels_denylist,omitempty"`
+
+	// LabelsBlackList will be removed after October 2021, use
+	// labels_denylist instead
 	LabelsBlackList []string `json:"labels_blacklist,omitempty"`
+
+	// Filenames allows configuring repos to use a separate set of filenames for
+	// any plugin that interacts with these files. Keys are in "org/repo" format.
+	Filenames map[string]ownersconfig.Filenames `json:"filenames,omitempty"`
+}
+
+// OwnersFilenames determines which filenames to use for OWNERS and OWNERS_ALIASES for a repo.
+func (c *Configuration) OwnersFilenames(org, repo string) ownersconfig.Filenames {
+	full := fmt.Sprintf("%s/%s", org, repo)
+	if config, configured := c.Owners.Filenames[full]; configured {
+		return config
+	}
+	return ownersconfig.Filenames{
+		Owners:        ownersconfig.DefaultOwnersFile,
+		OwnersAliases: ownersconfig.DefaultOwnersAliasesFile,
+	}
 }
 
 // MDYAMLEnabled returns a boolean denoting if the passed repo supports YAML OWNERS config headers
@@ -180,12 +225,6 @@ func (c *Configuration) SkipCollaborators(org, repo string) bool {
 		}
 	}
 	return false
-}
-
-// RequireSIG specifies configuration for the require-sig plugin.
-type RequireSIG struct {
-	// GroupListURL is the URL where a list of the available SIGs can be found.
-	GroupListURL string `json:"group_list_url,omitempty"`
 }
 
 // Retitle specifies configuration for the retitle plugin.
@@ -231,6 +270,11 @@ type Size struct {
 type Blockade struct {
 	// Repos are either of the form org/repos or just org.
 	Repos []string `json:"repos,omitempty"`
+	// BranchRegexp is the regular expression for branches that the the blockade applies to.
+	// If BranchRegexp is not specified, the blockade applies to all branches by default.
+	// Compiles into BranchRe during config load.
+	BranchRegexp *string        `json:"branchregexp,omitempty"`
+	BranchRe     *regexp.Regexp `json:"-"`
 	// BlockRegexps are regular expressions matching the file paths to block.
 	BlockRegexps []string `json:"blockregexps,omitempty"`
 	// ExceptionRegexps are regular expressions matching the file paths that are exceptions to the BlockRegexps.
@@ -249,46 +293,38 @@ type Approve struct {
 	// IssueRequired indicates if an associated issue is required for approval in
 	// the specified repos.
 	IssueRequired bool `json:"issue_required,omitempty"`
-
-	// TODO(fejta): delete in June 2019
-	DeprecatedImplicitSelfApprove *bool `json:"implicit_self_approve,omitempty"`
 	// RequireSelfApproval requires PR authors to explicitly approve their PRs.
 	// Otherwise the plugin assumes the author of the PR approves the changes in the PR.
 	RequireSelfApproval *bool `json:"require_self_approval,omitempty"`
-
 	// LgtmActsAsApprove indicates that the lgtm command should be used to
 	// indicate approval
 	LgtmActsAsApprove bool `json:"lgtm_acts_as_approve,omitempty"`
-
-	// ReviewActsAsApprove should be replaced with its non-deprecated inverse: ignore_review_state.
-	// TODO(fejta): delete in June 2019
-	DeprecatedReviewActsAsApprove *bool `json:"review_acts_as_approve,omitempty"`
 	// IgnoreReviewState causes the approve plugin to ignore the GitHub review state. Otherwise:
 	// * an APPROVE github review is equivalent to leaving an "/approve" message.
 	// * A REQUEST_CHANGES github review is equivalent to leaving an /approve cancel" message.
 	IgnoreReviewState *bool `json:"ignore_review_state,omitempty"`
+	// CommandHelpLink is the link to the help page which shows the available commands for each repo.
+	// The default value is "https://go.k8s.io/bot-commands". The command help page is served by Deck
+	// and available under https://<deck-url>/command-help, e.g. "https://prow.k8s.io/command-help"
+	CommandHelpLink string `json:"commandHelpLink"`
+	// PrProcessLink is the link to the help page which explains the code review process.
+	// The default value is "https://git.k8s.io/community/contributors/guide/owners.md#the-code-review-process".
+	PrProcessLink string `json:"pr_process_link,omitempty"`
 }
 
 var (
-	warnImplicitSelfApprove time.Time
-	warnReviewActsAsApprove time.Time
+	warnDependentBugTargetRelease time.Time
 )
 
 func (a Approve) HasSelfApproval() bool {
-	if a.DeprecatedImplicitSelfApprove != nil {
-		warnDeprecated(&warnImplicitSelfApprove, 5*time.Minute, "Please update plugins.yaml to use require_self_approval instead of the deprecated implicit_self_approve before June 2019")
-		return *a.DeprecatedImplicitSelfApprove
-	} else if a.RequireSelfApproval != nil {
+	if a.RequireSelfApproval != nil {
 		return !*a.RequireSelfApproval
 	}
 	return true
 }
 
 func (a Approve) ConsiderReviewState() bool {
-	if a.DeprecatedReviewActsAsApprove != nil {
-		warnDeprecated(&warnReviewActsAsApprove, 5*time.Minute, "Please update plugins.yaml to use ignore_review_state instead of the deprecated review_acts_as_approve before June 2019")
-		return *a.DeprecatedReviewActsAsApprove
-	} else if a.IgnoreReviewState != nil {
+	if a.IgnoreReviewState != nil {
 		return !*a.IgnoreReviewState
 	}
 	return true
@@ -313,9 +349,23 @@ type Lgtm struct {
 	StickyLgtmTeam string `json:"trusted_team_for_sticky_lgtm,omitempty"`
 }
 
+// Jira holds the config for the jira plugin.
+type Jira struct {
+	// DisabledJiraProjects are projects for which we will never try to create a link,
+	// for example including `enterprise` here would disable linking for all issues
+	// that start with `enterprise-` like `enterprise-4.` Matching is case-insenitive.
+	DisabledJiraProjects []string `json:"disabled_jira_projects,omitempty"`
+}
+
 // Cat contains the configuration for the cat plugin.
 type Cat struct {
 	// Path to file containing an api key for thecatapi.com
+	KeyPath string `json:"key_path,omitempty"`
+}
+
+// Goose contains the configuration for the goose plugin.
+type Goose struct {
+	// Path to file containing an api key for unsplash.com
 	KeyPath string `json:"key_path,omitempty"`
 }
 
@@ -332,8 +382,11 @@ type Label struct {
 type Trigger struct {
 	// Repos is either of the form org/repos or just org.
 	Repos []string `json:"repos,omitempty"`
-	// TrustedOrg is the org whose members' PRs will be automatically built
-	// for PRs to the above repos. The default is the PR's org.
+	// TrustedOrg is the org whose members' PRs will be automatically built for
+	// PRs to the above repos. The default is the PR's org.
+	//
+	// Deprecated: TrustedOrg functionality is deprecated and will be removed in
+	// January 2020.
 	TrustedOrg string `json:"trusted_org,omitempty"`
 	// JoinOrgURL is a link that redirects users to a location where they
 	// should be able to read more about joining the organization in order
@@ -345,9 +398,6 @@ type Trigger struct {
 	// IgnoreOkToTest makes trigger ignore /ok-to-test comments.
 	// This is a security mitigation to only allow testing from trusted users.
 	IgnoreOkToTest bool `json:"ignore_ok_to_test,omitempty"`
-	// ElideSkippedContexts makes trigger not post "Skipped" contexts for jobs
-	// that could run but do not run.
-	ElideSkippedContexts bool `json:"elide_skipped_contexts,omitempty"`
 }
 
 // Heart contains the configuration for the heart plugin.
@@ -392,44 +442,92 @@ type ConfigMapSpec struct {
 	// Name of ConfigMap
 	Name string `json:"name"`
 	// Key is the key in the ConfigMap to update with the file contents.
-	// If no explicit key is given, the basename of the file will be used.
+	// If no explicit key is given, the basename of the file will be used unless
+	// use_full_path_as_key: true is set, in which case the full filepath relative
+	// to the repository root will be used, replacing slashes with dashes.
 	Key string `json:"key,omitempty"`
-	// Namespace in which the configMap needs to be deployed. If no namespace is specified
-	// it will be deployed to the ProwJobNamespace.
-	Namespace string `json:"namespace,omitempty"`
-	// Namespaces in which the configMap needs to be deployed, in addition to the above
-	// namespace provided, or the default if it is not set.
-	AdditionalNamespaces []string `json:"additional_namespaces,omitempty"`
 	// GZIP toggles whether the key's data should be GZIP'd before being stored
 	// If set to false and the global GZIP option is enabled, this file will
 	// will not be GZIP'd.
 	GZIP *bool `json:"gzip,omitempty"`
-	// Namespaces is the fully resolved list of Namespaces to deploy the ConfigMap in
-	Namespaces []string `json:"-"`
+	// Clusters is a map from cluster to namespaces
+	// which specifies the targets the configMap needs to be deployed, i.e., each namespace in map[cluster]
+	Clusters map[string][]string `json:"clusters"`
+	// ClusterGroup is a list of named cluster_groups to target. Mutually exclusive with clusters.
+	ClusterGroups []string `json:"cluster_groups,omitempty"`
+	// UseFullPathAsKey controls if the full path of the original file relative to the
+	// repository root should be used as the configmap key. Slashes will be replaced by
+	// dashes. Using this avoids the need for unique file names in the original repo.
+	UseFullPathAsKey bool `json:"use_full_path_as_key,omitempty"`
+}
+
+// A ClusterGroup is a list of clusters with namespaces
+type ClusterGroup struct {
+	Clusters   []string `json:"clusters,omitempty"`
+	Namespaces []string `json:"namespaces,omitempty"`
 }
 
 // ConfigUpdater contains the configuration for the config-updater plugin.
 type ConfigUpdater struct {
+	// ClusterGroups is a map of ClusterGroups that can be used as a target
+	// in the map config.
+	ClusterGroups map[string]ClusterGroup `json:"cluster_groups,omitempty"`
 	// A map of filename => ConfigMapSpec.
 	// Whenever a commit changes filename, prow will update the corresponding configmap.
 	// map[string]ConfigMapSpec{ "/my/path.yaml": {Name: "foo", Namespace: "otherNamespace" }}
 	// will result in replacing the foo configmap whenever path.yaml changes
 	Maps map[string]ConfigMapSpec `json:"maps,omitempty"`
-	// The location of the prow configuration file inside the repository
-	// where the config-updater plugin is enabled. This needs to be relative
-	// to the root of the repository, eg. "config/prow/config.yaml" will match
-	// github.com/kubernetes/test-infra/config/prow/config.yaml assuming the config-updater
-	// plugin is enabled for kubernetes/test-infra. Defaults to "config/prow/config.yaml".
-	ConfigFile string `json:"config_file,omitempty"`
-	// The location of the prow plugin configuration file inside the repository
-	// where the config-updater plugin is enabled. This needs to be relative
-	// to the root of the repository, eg. "config/prow/plugins.yaml" will match
-	// github.com/kubernetes/test-infra/config/prow/plugins.yaml assuming the config-updater
-	// plugin is enabled for kubernetes/test-infra. Defaults to "config/prow/plugins.yaml".
-	PluginFile string `json:"plugin_file,omitempty"`
 	// If GZIP is true then files will be gzipped before insertion into
 	// their corresponding configmap
 	GZIP bool `json:"gzip"`
+}
+
+type configUpdatedWithoutUnmarshaler ConfigUpdater
+
+func (cu *ConfigUpdater) UnmarshalJSON(d []byte) error {
+	var target configUpdatedWithoutUnmarshaler
+	if err := json.Unmarshal(d, &target); err != nil {
+		return err
+	}
+	*cu = ConfigUpdater(target)
+	return cu.resolve()
+}
+
+func (cu *ConfigUpdater) resolve() error {
+	var errs []error
+	for k, v := range cu.Maps {
+		if len(v.Clusters) > 0 && len(v.ClusterGroups) > 0 {
+			errs = append(errs, fmt.Errorf("item maps.%s contains both clusters and cluster_groups", k))
+			continue
+		}
+
+		if len(v.Clusters) > 0 {
+			continue
+		}
+
+		clusters := map[string][]string{}
+		for idx, clusterGroupName := range v.ClusterGroups {
+			clusterGroup, hasClusterGroup := cu.ClusterGroups[clusterGroupName]
+			if !hasClusterGroup {
+				errs = append(errs, fmt.Errorf("item maps.%s.cluster_groups.%d references inexistent cluster group named %s", k, idx, clusterGroupName))
+				continue
+			}
+			for _, cluster := range clusterGroup.Clusters {
+				clusters[cluster] = append(clusters[cluster], clusterGroup.Namespaces...)
+			}
+		}
+
+		cu.Maps[k] = ConfigMapSpec{
+			Name:     v.Name,
+			Key:      v.Key,
+			GZIP:     v.GZIP,
+			Clusters: clusters,
+		}
+	}
+
+	cu.ClusterGroups = nil
+
+	return utilerrors.NewAggregate(errs)
 }
 
 // ProjectConfig contains the configuration options for the project plugin
@@ -459,18 +557,51 @@ type ProjectRepoConfig struct {
 	ProjectColumnMap map[string]string `json:"repo_default_column_map,omitempty"`
 }
 
+// ProjectManager represents the config for the ProjectManager plugin, holding top
+// level config options, configuration is a hierarchial structure with top level element
+// being org or org/repo with the list of projects as its children
+type ProjectManager struct {
+	OrgRepos map[string]ManagedOrgRepo `json:"orgsRepos,omitempty"`
+}
+
+// ManagedOrgRepo is used by the ProjectManager plugin to represent an Organisation
+// or Repository with a list of Projects
+type ManagedOrgRepo struct {
+	Projects map[string]ManagedProject `json:"projects,omitempty"`
+}
+
+// ManagedProject is used by the ProjectManager plugin to represent a Project
+// with a list of Columns
+type ManagedProject struct {
+	Columns []ManagedColumn `json:"columns,omitempty"`
+}
+
+// ManagedColumn is used by the ProjectQueries plugin to represent a project column
+// and the conditions to add a PR to that column
+type ManagedColumn struct {
+	// Either of ID or Name should be specified
+	ID   *int   `json:"id,omitempty"`
+	Name string `json:"name,omitempty"`
+	// State must be open, closed or all
+	State string `json:"state,omitempty"`
+	// all the labels here should match to the incoming event to be bale to add the card to the project
+	Labels []string `json:"labels,omitempty"`
+	// Configuration is effective is the issue events repo/Owner/Login matched the org
+	Org string `json:"org,omitempty"`
+}
+
 // MergeWarning is a config for the slackevents plugin's manual merge warnings.
 // If a PR is pushed to any of the repos listed in the config then send messages
-// to the all the slack channels listed if pusher is NOT in the whitelist.
+// to the all the slack channels listed if pusher is NOT in the allowlist.
 type MergeWarning struct {
 	// Repos is either of the form org/repos or just org.
 	Repos []string `json:"repos,omitempty"`
 	// List of channels on which a event is published.
 	Channels []string `json:"channels,omitempty"`
-	// A slack event is published if the user is not part of the WhiteList.
-	WhiteList []string `json:"whitelist,omitempty"`
-	// A slack event is published if the user is not on the branch whitelist
-	BranchWhiteList map[string][]string `json:"branch_whitelist,omitempty"`
+	// A slack event is published if the user is not part of the ExemptUsers.
+	ExemptUsers []string `json:"exempt_users,omitempty"`
+	// A slack event is published if the user is not on the exempt branches.
+	ExemptBranches map[string][]string `json:"exempt_branches,omitempty"`
 }
 
 // Welcome is config for the welcome plugin.
@@ -578,29 +709,6 @@ func (r RequireMatchingLabel) validate() error {
 	return nil
 }
 
-var warnLock sync.RWMutex // Rare updates and concurrent readers, so reuse the same lock
-
-// warnDeprecated prints a deprecation warning for a particular configuration
-// option.
-func warnDeprecated(last *time.Time, freq time.Duration, msg string) {
-	// have we warned within the last freq?
-	warnLock.RLock()
-	fresh := time.Now().Sub(*last) <= freq
-	warnLock.RUnlock()
-	if fresh { // we've warned recently
-		return
-	}
-	// Warning is stale, will we win the race to warn?
-	warnLock.Lock()
-	defer warnLock.Unlock()
-	now := time.Now()           // Recalculate now, we might wait awhile for the lock
-	if now.Sub(*last) <= freq { // Nope, we lost
-		return
-	}
-	*last = now
-	logrus.Warn(msg)
-}
-
 // Describe generates a human readable description of the behavior that this
 // configuration specifies.
 func (r RequireMatchingLabel) Describe() string {
@@ -634,18 +742,83 @@ func (r RequireMatchingLabel) Describe() string {
 	return str.String()
 }
 
+// ApproveFor finds the Approve for a repo, if one exists.
+// Approval configuration can be listed for a repository
+// or an organization.
+func (c *Configuration) ApproveFor(org, repo string) *Approve {
+	fullName := fmt.Sprintf("%s/%s", org, repo)
+
+	a := func() *Approve {
+		// First search for repo config
+		for _, approve := range c.Approve {
+			if !sets.NewString(approve.Repos...).Has(fullName) {
+				continue
+			}
+			return &approve
+		}
+
+		// If you don't find anything, loop again looking for an org config
+		for _, approve := range c.Approve {
+			if !sets.NewString(approve.Repos...).Has(org) {
+				continue
+			}
+			return &approve
+		}
+
+		// Return an empty config, and use plugin defaults
+		return &Approve{}
+	}()
+	if a.CommandHelpLink == "" {
+		a.CommandHelpLink = "https://go.k8s.io/bot-commands"
+	}
+	if a.PrProcessLink == "" {
+		a.PrProcessLink = "https://git.k8s.io/community/contributors/guide/owners.md#the-code-review-process"
+	}
+	return a
+}
+
+// LgtmFor finds the Lgtm for a repo, if one exists
+// a trigger can be listed for the repo itself or for the
+// owning organization
+func (c *Configuration) LgtmFor(org, repo string) *Lgtm {
+	fullName := fmt.Sprintf("%s/%s", org, repo)
+	for _, lgtm := range c.Lgtm {
+		if !sets.NewString(lgtm.Repos...).Has(fullName) {
+			continue
+		}
+		return &lgtm
+	}
+	// If you don't find anything, loop again looking for an org config
+	for _, lgtm := range c.Lgtm {
+		if !sets.NewString(lgtm.Repos...).Has(org) {
+			continue
+		}
+		return &lgtm
+	}
+	return &Lgtm{}
+}
+
 // TriggerFor finds the Trigger for a repo, if one exists
 // a trigger can be listed for the repo itself or for the
 // owning organization
 func (c *Configuration) TriggerFor(org, repo string) Trigger {
+	orgRepo := fmt.Sprintf("%s/%s", org, repo)
 	for _, tr := range c.Triggers {
 		for _, r := range tr.Repos {
-			if r == org || r == fmt.Sprintf("%s/%s", org, repo) {
+			if r == org || r == orgRepo {
 				return tr
 			}
 		}
 	}
-	return Trigger{}
+	var tr Trigger
+	tr.SetDefaults()
+	return tr
+}
+
+func (t *Trigger) SetDefaults() {
+	if t.TrustedOrg != "" && t.JoinOrgURL == "" {
+		t.JoinOrgURL = fmt.Sprintf("https://github.com/orgs/%s/people", t.TrustedOrg)
+	}
 }
 
 // DcoFor finds the Dco for a repo, if one exists
@@ -664,11 +837,39 @@ func (c *Configuration) DcoFor(org, repo string) *Dco {
 	return &Dco{}
 }
 
+func OldToNewPlugins(oldPlugins map[string][]string) Plugins {
+	newPlugins := make(Plugins)
+	for repo, plugins := range oldPlugins {
+		newPlugins[repo] = OrgPlugins{
+			Plugins: plugins,
+		}
+	}
+	return newPlugins
+}
+
+type pluginsWithoutUnmarshaler Plugins
+
+var warnTriggerDeprecatedConfig time.Time
+
+func (p *Plugins) UnmarshalJSON(d []byte) error {
+	var oldPlugins map[string][]string
+	if err := yaml.Unmarshal(d, &oldPlugins); err == nil {
+		logrusutil.ThrottledWarnf(&warnTriggerDeprecatedConfig, time.Hour, "plugins declaration uses a deprecated config style, see https://github.com/kubernetes/test-infra/issues/20631#issuecomment-787693609 for a migration guide")
+		*p = OldToNewPlugins(oldPlugins)
+		return nil
+	}
+	var target pluginsWithoutUnmarshaler
+	err := yaml.Unmarshal(d, &target)
+	*p = Plugins(target)
+	return err
+}
+
 // EnabledReposForPlugin returns the orgs and repos that have enabled the passed plugin.
-func (c *Configuration) EnabledReposForPlugin(plugin string) (orgs, repos []string) {
+func (c *Configuration) EnabledReposForPlugin(plugin string) (orgs, repos []string, orgExceptions map[string]sets.String) {
+	orgExceptions = make(map[string]sets.String)
 	for repo, plugins := range c.Plugins {
 		found := false
-		for _, candidate := range plugins {
+		for _, candidate := range plugins.Plugins {
 			if candidate == plugin {
 				found = true
 				break
@@ -679,8 +880,17 @@ func (c *Configuration) EnabledReposForPlugin(plugin string) (orgs, repos []stri
 				repos = append(repos, repo)
 			} else {
 				orgs = append(orgs, repo)
+				orgExceptions[repo] = sets.NewString()
+				for _, excludedRepo := range plugins.ExcludedRepos {
+					orgExceptions[repo].Insert(fmt.Sprintf("%s/%s", repo, excludedRepo))
+				}
 			}
 		}
+	}
+	// <plugin> plugin might be declared in both org and org/repo
+	// in that case, remove repo from org's orgExceptions despite the excluded_repo in org
+	for _, repo := range repos {
+		orgExceptions[strings.Split(repo, "/")[0]].Delete(repo)
 	}
 	return
 }
@@ -708,37 +918,29 @@ func (c *Configuration) EnabledReposForExternalPlugin(plugin string) (orgs, repo
 }
 
 // SetDefaults sets default options for config updating
-func (c *ConfigUpdater) SetDefaults() {
-	if len(c.Maps) == 0 {
-		cf := c.ConfigFile
-		if cf == "" {
-			cf = "config/prow/config.yaml"
-		} else {
-			logrus.Warnf(`config_file is deprecated, please switch to "maps": {"%s": "config"} before July 2018`, cf)
-		}
-		pf := c.PluginFile
-		if pf == "" {
-			pf = "config/prow/plugins.yaml"
-		} else {
-			logrus.Warnf(`plugin_file is deprecated, please switch to "maps": {"%s": "plugins"} before July 2018`, pf)
-		}
-		c.Maps = map[string]ConfigMapSpec{
-			cf: {
+func (cu *ConfigUpdater) SetDefaults() {
+	if len(cu.Maps) == 0 {
+		cu.Maps = map[string]ConfigMapSpec{
+			"config/prow/config.yaml": {
 				Name: "config",
 			},
-			pf: {
+			"config/prow/plugins.yaml": {
 				Name: "plugins",
 			},
 		}
 	}
 
-	for name, spec := range c.Maps {
-		spec.Namespaces = append([]string{spec.Namespace}, spec.AdditionalNamespaces...)
-		c.Maps[name] = spec
+	for name, spec := range cu.Maps {
+		if len(spec.Clusters) == 0 {
+			spec.Clusters = map[string][]string{kube.DefaultClusterAlias: {""}}
+		}
+		cu.Maps[name] = spec
 	}
 }
 
 func (c *Configuration) setDefaults() {
+	c.Help.setDefaults()
+
 	c.ConfigUpdater.SetDefaults()
 
 	for repo, plugins := range c.ExternalPlugins {
@@ -749,21 +951,22 @@ func (c *Configuration) setDefaults() {
 			c.ExternalPlugins[repo][i].Endpoint = fmt.Sprintf("http://%s", p.Name)
 		}
 	}
-	if c.Blunderbuss.ReviewerCount == nil && c.Blunderbuss.FileWeightCount == nil {
+	if c.Blunderbuss.ReviewerCount == nil {
 		c.Blunderbuss.ReviewerCount = new(int)
 		*c.Blunderbuss.ReviewerCount = defaultBlunderbussReviewerCount
 	}
-	for i, trigger := range c.Triggers {
-		if trigger.TrustedOrg == "" || trigger.JoinOrgURL != "" {
-			continue
-		}
-		c.Triggers[i].JoinOrgURL = fmt.Sprintf("https://github.com/orgs/%s/people", trigger.TrustedOrg)
+	for i := range c.Triggers {
+		c.Triggers[i].SetDefaults()
 	}
 	if c.SigMention.Regexp == "" {
 		c.SigMention.Regexp = `(?m)@kubernetes/sig-([\w-]*)-(misc|test-failures|bugs|feature-requests|proposals|pr-reviews|api-reviews)`
 	}
-	if c.Owners.LabelsBlackList == nil {
-		c.Owners.LabelsBlackList = []string{labels.Approved, labels.LGTM}
+	if c.Owners.LabelsDenyList == nil {
+		if c.Owners.LabelsBlackList != nil {
+			c.Owners.LabelsDenyList = c.Owners.LabelsBlackList
+		} else {
+			c.Owners.LabelsDenyList = []string{labels.Approved, labels.LGTM}
+		}
 	}
 	for _, milestone := range c.RepoMilestone {
 		if milestone.MaintainersFriendlyName == "" {
@@ -787,17 +990,17 @@ func (c *Configuration) setDefaults() {
 // validatePluginsDupes will return an error if there are duplicated plugins.
 // It is sometimes a sign of misconfiguration and is always useless for a
 // plugin to be specified at both the org and repo levels.
-func validatePluginsDupes(plugins map[string][]string) error {
+func validatePluginsDupes(plugins Plugins) error {
 	var errors []error
 	for repo, repoConfig := range plugins {
 		if strings.Contains(repo, "/") {
 			org := strings.Split(repo, "/")[0]
-			if dupes := findDuplicatedPluginConfig(repoConfig, plugins[org]); len(dupes) > 0 {
+			if dupes := findDuplicatedPluginConfig(repoConfig.Plugins, plugins[org].Plugins); len(dupes) > 0 {
 				errors = append(errors, fmt.Errorf("plugins %v are duplicated for %s and %s", dupes, repo, org))
 			}
 		}
 	}
-	return errorutil.NewAggregate(errors...)
+	return utilerrors.NewAggregate(errors)
 }
 
 // ValidatePluginsUnknown will return an error if there are any unrecognized
@@ -805,13 +1008,13 @@ func validatePluginsDupes(plugins map[string][]string) error {
 func (c *Configuration) ValidatePluginsUnknown() error {
 	var errors []error
 	for _, configuration := range c.Plugins {
-		for _, plugin := range configuration {
+		for _, plugin := range configuration.Plugins {
 			if _, ok := pluginHelp[plugin]; !ok {
 				errors = append(errors, fmt.Errorf("unknown plugin: %s", plugin))
 			}
 		}
 	}
-	return errorutil.NewAggregate(errors...)
+	return utilerrors.NewAggregate(errors)
 }
 
 func validateSizes(size Size) error {
@@ -865,45 +1068,44 @@ func validateExternalPlugins(pluginMap map[string][]ExternalPlugin) error {
 	return nil
 }
 
-var warnBlunderbussFileWeightCount time.Time
-
 func validateBlunderbuss(b *Blunderbuss) error {
-	if b.ReviewerCount != nil && b.FileWeightCount != nil {
-		return errors.New("cannot use both request_count and file_weight_count in blunderbuss")
-	}
 	if b.ReviewerCount != nil && *b.ReviewerCount < 1 {
 		return fmt.Errorf("invalid request_count: %v (needs to be positive)", *b.ReviewerCount)
-	}
-	if b.FileWeightCount != nil && *b.FileWeightCount < 1 {
-		return fmt.Errorf("invalid file_weight_count: %v (needs to be positive)", *b.FileWeightCount)
-	}
-	if b.FileWeightCount != nil {
-		warnDeprecated(&warnBlunderbussFileWeightCount, 5*time.Minute, "file_weight_count is being deprecated in favour of max_request_count. Please ensure your configuration is updated before the end of May 2019.")
 	}
 	return nil
 }
 
+// ConfigMapID is a name/namespace/cluster combination that identifies a config map
+type ConfigMapID struct {
+	Name, Namespace, Cluster string
+}
+
 func validateConfigUpdater(updater *ConfigUpdater) error {
-	files := sets.NewString()
-	configMapKeys := map[string]sets.String{}
+	updater.SetDefaults()
+	configMapKeys := map[ConfigMapID]sets.String{}
 	for file, config := range updater.Maps {
-		if files.Has(file) {
-			return fmt.Errorf("file %s listed more than once in config updater config", file)
-		}
-		files.Insert(file)
+		for cluster, namespaces := range config.Clusters {
+			for _, namespace := range namespaces {
+				cmID := ConfigMapID{
+					Name:      config.Name,
+					Namespace: namespace,
+					Cluster:   cluster,
+				}
 
-		key := config.Key
-		if key == "" {
-			key = path.Base(file)
-		}
+				key := config.Key
+				if key == "" {
+					key = path.Base(file)
+				}
 
-		if _, ok := configMapKeys[config.Name]; ok {
-			if configMapKeys[config.Name].Has(key) {
-				return fmt.Errorf("key %s in configmap %s updated with more than one file", key, config.Name)
+				if _, ok := configMapKeys[cmID]; ok {
+					if configMapKeys[cmID].Has(key) {
+						return fmt.Errorf("key %s in configmap %s updated with more than one file", key, config.Name)
+					}
+					configMapKeys[cmID].Insert(key)
+				} else {
+					configMapKeys[cmID] = sets.NewString(key)
+				}
 			}
-			configMapKeys[config.Name].Insert(key)
-		} else {
-			configMapKeys[config.Name] = sets.NewString(key)
 		}
 	}
 	return nil
@@ -913,6 +1115,57 @@ func validateRequireMatchingLabel(rs []RequireMatchingLabel) error {
 	for i, r := range rs {
 		if err := r.validate(); err != nil {
 			return fmt.Errorf("error validating require_matching_label config #%d: %v", i, err)
+		}
+	}
+	return nil
+}
+
+func validateProjectManager(pm ProjectManager) error {
+
+	projectConfig := pm
+	// No ProjectManager configuration provided, we have nothing to validate
+	if len(projectConfig.OrgRepos) == 0 {
+		return nil
+	}
+
+	for orgRepoName, managedOrgRepo := range pm.OrgRepos {
+		if len(managedOrgRepo.Projects) == 0 {
+			return fmt.Errorf("Org/repo: %s, has no projects configured", orgRepoName)
+		}
+		for projectName, managedProject := range managedOrgRepo.Projects {
+			var labelSets []sets.String
+			if len(managedProject.Columns) == 0 {
+				return fmt.Errorf("Org/repo: %s, project %s, has no columns configured", orgRepoName, projectName)
+			}
+			for _, managedColumn := range managedProject.Columns {
+				if managedColumn.ID == nil && (len(managedColumn.Name) == 0) {
+					return fmt.Errorf("Org/repo: %s, project %s, column %v, has no name/id configured", orgRepoName, projectName, managedColumn)
+				}
+				if len(managedColumn.Labels) == 0 {
+					return fmt.Errorf("Org/repo: %s, project %s, column %s, has no labels configured", orgRepoName, projectName, managedColumn.Name)
+				}
+				if len(managedColumn.Org) == 0 {
+					return fmt.Errorf("Org/repo: %s, project %s, column %s, has no org configured", orgRepoName, projectName, managedColumn.Name)
+				}
+				sSet := sets.NewString(managedColumn.Labels...)
+				for _, labels := range labelSets {
+					if sSet.Equal(labels) {
+						return fmt.Errorf("Org/repo: %s, project %s, column %s has same labels configured as another column", orgRepoName, projectName, managedColumn.Name)
+					}
+				}
+				labelSets = append(labelSets, sSet)
+			}
+		}
+	}
+	return nil
+}
+
+var warnTriggerTrustedOrg time.Time
+
+func validateTrigger(triggers []Trigger) error {
+	for _, trigger := range triggers {
+		if trigger.TrustedOrg != "" {
+			logrusutil.ThrottledWarnf(&warnTriggerTrustedOrg, 5*time.Minute, "trusted_org functionality is deprecated. Please ensure your configuration is updated before the end of December 2019.")
 		}
 	}
 	return nil
@@ -930,6 +1183,17 @@ func compileRegexpsAndDurations(pc *Configuration) error {
 		return err
 	}
 	pc.CherryPickUnapproved.BranchRe = branchRe
+
+	for i := range pc.Blockades {
+		if pc.Blockades[i].BranchRegexp == nil {
+			continue
+		}
+		branchRe, err := regexp.Compile(*pc.Blockades[i].BranchRegexp)
+		if err != nil {
+			return fmt.Errorf("failed to compile blockade branchregexp: %q, error: %v", *pc.Blockades[i].BranchRegexp, err)
+		}
+		pc.Blockades[i].BranchRe = branchRe
+	}
 
 	commentRe, err := regexp.Compile(pc.Heart.CommentRegexp)
 	if err != nil {
@@ -960,6 +1224,9 @@ func (c *Configuration) Validate() error {
 		logrus.Warn("no plugins specified-- check syntax?")
 	}
 
+	if c.Owners.LabelsBlackList != nil && c.Owners.LabelsDenyList != nil {
+		return errors.New("labels_blacklist and labels_denylist cannot be both supplied")
+	}
 	// Defaulting should run before validation.
 	c.setDefaults()
 	// Regexp compilation should run after defaulting, but before validation.
@@ -983,6 +1250,12 @@ func (c *Configuration) Validate() error {
 		return err
 	}
 	if err := validateRequireMatchingLabel(c.RequireMatchingLabel); err != nil {
+		return err
+	}
+	if err := validateProjectManager(c.ProjectManager); err != nil {
+		return err
+	}
+	if err := validateTrigger(c.Triggers); err != nil {
 		return err
 	}
 
@@ -1031,25 +1304,25 @@ func (pluginConfig *ProjectConfig) GetOrgColumnMap(org string) map[string]string
 type Bugzilla struct {
 	// Default settings mapped by branch in any repo in any org.
 	// The `*` wildcard will apply to all branches.
-	Default map[string]BugzillaBranchOptions `json:"default"`
+	Default map[string]BugzillaBranchOptions `json:"default,omitempty"`
 	// Options for specific orgs. The `*` wildcard will apply to all orgs.
-	Orgs map[string]BugzillaOrgOptions `json:"orgs"`
+	Orgs map[string]BugzillaOrgOptions `json:"orgs,omitempty"`
 }
 
 // BugzillaOrgOptions holds options for checking Bugzilla bugs for an org.
 type BugzillaOrgOptions struct {
 	// Default settings mapped by branch in any repo in this org.
 	// The `*` wildcard will apply to all branches.
-	Default map[string]BugzillaBranchOptions `json:"default"`
+	Default map[string]BugzillaBranchOptions `json:"default,omitempty"`
 	// Options for specific repos. The `*` wildcard will apply to all repos.
-	Repos map[string]BugzillaRepoOptions `json:"repos"`
+	Repos map[string]BugzillaRepoOptions `json:"repos,omitempty"`
 }
 
 // BugzillaRepoOptions holds options for checking Bugzilla bugs for a repo.
 type BugzillaRepoOptions struct {
 	// Options for specific branches in this repo.
 	// The `*` wildcard will apply to all branches.
-	Branches map[string]BugzillaBranchOptions `json:"branches"`
+	Branches map[string]BugzillaBranchOptions `json:"branches,omitempty"`
 }
 
 // BugzillaBugState describes bug states in the Bugzilla plugin config, used
@@ -1115,6 +1388,9 @@ func (s *BugzillaBugState) Matches(bug *bugzilla.Bug) bool {
 // the `ResolveBugzillaOptions` method to handle existing config, and is also
 // able to sufficiently resolve the presence of both types of fields.
 type BugzillaBranchOptions struct {
+	// ExcludeDefaults excludes defaults from more generic Bugzilla configurations.
+	ExcludeDefaults *bool `json:"exclude_defaults,omitempty"`
+
 	// ValidateByDefault determines whether a validation check is run for all pull
 	// requests by default
 	ValidateByDefault *bool `json:"validate_by_default,omitempty"`
@@ -1129,13 +1405,24 @@ type BugzillaBranchOptions struct {
 	ValidStates *[]BugzillaBugState `json:"valid_states,omitempty"`
 
 	// DependentBugStatuses determine which statuses a bug's dependent bugs may have
-	// to deem the child bug valid
+	// to deem the child bug valid.  These are merged into DependentBugStates when
+	// resolving branch options.
 	DependentBugStatuses *[]string `json:"dependent_bug_statuses,omitempty"`
 	// DependentBugStates determine states in which a bug's dependents bugs may be
-	// to deem the child bug valid
+	// to deem the child bug valid.  If set, all blockers must have a valid state.
 	DependentBugStates *[]BugzillaBugState `json:"dependent_bug_states,omitempty"`
-	// DependentBugTargetRelease determines which release a bug's dependent bugs need to target to be valid
-	DependentBugTargetRelease *string `json:"dependent_bug_target_release,omitempty"`
+	// DependentBugTargetReleases determines the set of valid target
+	// releases for dependent bugs.  If set, all blockers must have a
+	// valid target release.
+	DependentBugTargetReleases *[]string `json:"dependent_bug_target_releases,omitempty"`
+	// DeprecatedDependentBugTargetRelease determines which release a
+	// bug's dependent bugs need to target to be valid.  If set, all
+	// blockers must have a valid target releasee.
+	//
+	// Deprecated: Use DependentBugTargetReleases instead.  If set,
+	// DependentBugTargetRelease will be appended to
+	// DeprecatedDependentBugTargetReleases.
+	DeprecatedDependentBugTargetRelease *string `json:"dependent_bug_target_release,omitempty"`
 
 	// StatusAfterValidation is the status which the bug will be moved to after being
 	// deemed valid and linked to a PR. Will implicitly be considered a part of `statuses`
@@ -1144,7 +1431,7 @@ type BugzillaBranchOptions struct {
 	// StateAfterValidation is the state to which the bug will be moved after being
 	// deemed valid and linked to a PR. Will implicitly be considered a part of `ValidStates`
 	// if others are set.
-	StateAfterValidation *BugzillaBugState `json:"state_after_validation"`
+	StateAfterValidation *BugzillaBugState `json:"state_after_validation,omitempty"`
 	// AddExternalLink determines whether the pull request will be added to the Bugzilla
 	// bug using the ExternalBug tracker API after being validated
 	AddExternalLink *bool `json:"add_external_link,omitempty"`
@@ -1154,6 +1441,14 @@ type BugzillaBranchOptions struct {
 	// StateAfterMerge is the state to which the bug will be moved after all pull requests
 	// in the external bug tracker have been merged.
 	StateAfterMerge *BugzillaBugState `json:"state_after_merge,omitempty"`
+	// StateAfterClose is the state to which the bug will be moved if all pull requests
+	// in the external bug tracker have been closed.
+	StateAfterClose *BugzillaBugState `json:"state_after_close,omitempty"`
+
+	// AllowedGroups is a list of bugzilla bug group names that the bugzilla plugin can
+	// link to in PRs. If a bug is part of a group that is not in this list, the bugzilla
+	// plugin will not link the bug to the PR.
+	AllowedGroups []string `json:"allowed_groups,omitempty"`
 }
 
 type BugzillaBugStateSet map[BugzillaBugState]interface{}
@@ -1257,49 +1552,75 @@ func mergeStatusesIntoStates(states *[]BugzillaBugState, statuses *[]string) *[]
 func ResolveBugzillaOptions(parent, child BugzillaBranchOptions) BugzillaBranchOptions {
 	output := BugzillaBranchOptions{}
 
-	// populate with the parent
-	if parent.ValidateByDefault != nil {
-		output.ValidateByDefault = parent.ValidateByDefault
-	}
-	if parent.IsOpen != nil {
-		output.IsOpen = parent.IsOpen
-	}
-	if parent.TargetRelease != nil {
-		output.TargetRelease = parent.TargetRelease
-	}
-	if parent.ValidStates != nil {
-		output.ValidStates = parent.ValidStates
-	}
-	if parent.Statuses != nil {
-		output.Statuses = parent.Statuses
-		output.ValidStates = mergeStatusesIntoStates(output.ValidStates, parent.Statuses)
-	}
-	if parent.DependentBugStates != nil {
-		output.DependentBugStates = parent.DependentBugStates
-	}
-	if parent.DependentBugStatuses != nil {
-		output.DependentBugStatuses = parent.DependentBugStatuses
-		output.DependentBugStates = mergeStatusesIntoStates(output.DependentBugStates, parent.DependentBugStatuses)
-	}
-	if parent.StatusAfterValidation != nil {
-		output.StatusAfterValidation = parent.StatusAfterValidation
-		output.StateAfterValidation = &BugzillaBugState{Status: *output.StatusAfterValidation}
-	}
-	if parent.StateAfterValidation != nil {
-		output.StateAfterValidation = parent.StateAfterValidation
-	}
-	if parent.AddExternalLink != nil {
-		output.AddExternalLink = parent.AddExternalLink
-	}
-	if parent.StatusAfterMerge != nil {
-		output.StatusAfterMerge = parent.StatusAfterMerge
-		output.StateAfterMerge = &BugzillaBugState{Status: *output.StatusAfterMerge}
-	}
-	if parent.StateAfterMerge != nil {
-		output.StateAfterMerge = parent.StateAfterMerge
+	if child.ExcludeDefaults == nil || !*child.ExcludeDefaults {
+		// populate with the parent
+		if parent.ExcludeDefaults != nil {
+			output.ExcludeDefaults = parent.ExcludeDefaults
+		}
+		if parent.ValidateByDefault != nil {
+			output.ValidateByDefault = parent.ValidateByDefault
+		}
+		if parent.IsOpen != nil {
+			output.IsOpen = parent.IsOpen
+		}
+		if parent.TargetRelease != nil {
+			output.TargetRelease = parent.TargetRelease
+		}
+		if parent.ValidStates != nil {
+			output.ValidStates = parent.ValidStates
+		}
+		if parent.Statuses != nil {
+			output.Statuses = parent.Statuses
+			output.ValidStates = mergeStatusesIntoStates(output.ValidStates, parent.Statuses)
+		}
+		if parent.DependentBugStates != nil {
+			output.DependentBugStates = parent.DependentBugStates
+		}
+		if parent.DependentBugStatuses != nil {
+			output.DependentBugStatuses = parent.DependentBugStatuses
+			output.DependentBugStates = mergeStatusesIntoStates(output.DependentBugStates, parent.DependentBugStatuses)
+		}
+		if parent.DependentBugTargetReleases != nil {
+			output.DependentBugTargetReleases = parent.DependentBugTargetReleases
+		}
+		if parent.DeprecatedDependentBugTargetRelease != nil {
+			logrusutil.ThrottledWarnf(&warnDependentBugTargetRelease, 5*time.Minute, "Please update plugins.yaml to use dependent_bug_target_releases instead of the deprecated dependent_bug_target_release")
+			if parent.DependentBugTargetReleases == nil {
+				output.DependentBugTargetReleases = &[]string{*parent.DeprecatedDependentBugTargetRelease}
+			} else if !sets.NewString(*parent.DependentBugTargetReleases...).Has(*parent.DeprecatedDependentBugTargetRelease) {
+				dependentBugTargetReleases := append(*output.DependentBugTargetReleases, *parent.DeprecatedDependentBugTargetRelease)
+				output.DependentBugTargetReleases = &dependentBugTargetReleases
+			}
+		}
+		if parent.StatusAfterValidation != nil {
+			output.StatusAfterValidation = parent.StatusAfterValidation
+			output.StateAfterValidation = &BugzillaBugState{Status: *output.StatusAfterValidation}
+		}
+		if parent.StateAfterValidation != nil {
+			output.StateAfterValidation = parent.StateAfterValidation
+		}
+		if parent.AddExternalLink != nil {
+			output.AddExternalLink = parent.AddExternalLink
+		}
+		if parent.StatusAfterMerge != nil {
+			output.StatusAfterMerge = parent.StatusAfterMerge
+			output.StateAfterMerge = &BugzillaBugState{Status: *output.StatusAfterMerge}
+		}
+		if parent.StateAfterMerge != nil {
+			output.StateAfterMerge = parent.StateAfterMerge
+		}
+		if parent.StateAfterClose != nil {
+			output.StateAfterClose = parent.StateAfterClose
+		}
+		if parent.AllowedGroups != nil {
+			output.AllowedGroups = sets.NewString(output.AllowedGroups...).Insert(parent.AllowedGroups...).List()
+		}
 	}
 
 	// override with the child
+	if child.ExcludeDefaults != nil {
+		output.ExcludeDefaults = child.ExcludeDefaults
+	}
 	if child.ValidateByDefault != nil {
 		output.ValidateByDefault = child.ValidateByDefault
 	}
@@ -1331,6 +1652,18 @@ func ResolveBugzillaOptions(parent, child BugzillaBranchOptions) BugzillaBranchO
 		}
 		output.DependentBugStates = mergeStatusesIntoStates(output.DependentBugStates, child.DependentBugStatuses)
 	}
+	if child.DependentBugTargetReleases != nil {
+		output.DependentBugTargetReleases = child.DependentBugTargetReleases
+	}
+	if child.DeprecatedDependentBugTargetRelease != nil {
+		logrusutil.ThrottledWarnf(&warnDependentBugTargetRelease, 5*time.Minute, "Please update plugins.yaml to use dependent_bug_target_releases instead of the deprecated dependent_bug_target_release")
+		if child.DependentBugTargetReleases == nil {
+			output.DependentBugTargetReleases = &[]string{*child.DeprecatedDependentBugTargetRelease}
+		} else if !sets.NewString(*child.DependentBugTargetReleases...).Has(*child.DeprecatedDependentBugTargetRelease) {
+			dependentBugTargetReleases := append(*output.DependentBugTargetReleases, *child.DeprecatedDependentBugTargetRelease)
+			output.DependentBugTargetReleases = &dependentBugTargetReleases
+		}
+	}
 	if child.StatusAfterValidation != nil {
 		output.StatusAfterValidation = child.StatusAfterValidation
 		if child.StateAfterValidation == nil {
@@ -1351,6 +1684,12 @@ func ResolveBugzillaOptions(parent, child BugzillaBranchOptions) BugzillaBranchO
 	}
 	if child.StateAfterMerge != nil {
 		output.StateAfterMerge = child.StateAfterMerge
+	}
+	if child.StateAfterClose != nil {
+		output.StateAfterClose = child.StateAfterClose
+	}
+	if child.AllowedGroups != nil {
+		output.AllowedGroups = sets.NewString(output.AllowedGroups...).Insert(child.AllowedGroups...).List()
 	}
 
 	// Status fields should not be used anywhere now when they were mirrored to states
@@ -1420,4 +1759,176 @@ func (b *Bugzilla) OptionsForRepo(org, repo string) map[string]BugzillaBranchOpt
 	}
 
 	return options
+}
+
+// Override holds options for the override plugin
+type Override struct {
+	AllowTopLevelOwners bool `json:"allow_top_level_owners,omitempty"`
+	// AllowedGitHubTeams is a map of orgs and/or repositories (eg "org" or "org/repo") to list of GitHub team slugs,
+	// members of which are allowed to override contexts
+	AllowedGitHubTeams map[string][]string `json:"allowed_github_teams,omitempty"`
+}
+
+func (c *Configuration) mergeFrom(other *Configuration) error {
+	var errs []error
+	if diff := cmp.Diff(other, &Configuration{Approve: other.Approve, Bugzilla: other.Bugzilla, ExternalPlugins: other.ExternalPlugins, Lgtm: other.Lgtm, Plugins: other.Plugins}); diff != "" {
+		errs = append(errs, fmt.Errorf("supplemental plugin configuration has config that doesn't support merging: %s", diff))
+	}
+
+	if c.Plugins == nil {
+		c.Plugins = Plugins{}
+	}
+	if err := c.Plugins.mergeFrom(&other.Plugins); err != nil {
+		errs = append(errs, fmt.Errorf("failed to merge .plugins from supplemental config: %w", err))
+	}
+
+	if err := c.Bugzilla.mergeFrom(&other.Bugzilla); err != nil {
+		errs = append(errs, fmt.Errorf("failed to merge .bugzilla from supplemental config: %w", err))
+	}
+
+	c.Approve = append(c.Approve, other.Approve...)
+	c.Lgtm = append(c.Lgtm, other.Lgtm...)
+
+	if err := c.mergeExternalPluginsFrom(other.ExternalPlugins); err != nil {
+		errs = append(errs, fmt.Errorf("failed to merge .external-plugins from supplemental config: %w", err))
+	}
+
+	return utilerrors.NewAggregate(errs)
+}
+
+func (c *Configuration) mergeExternalPluginsFrom(other map[string][]ExternalPlugin) error {
+	if c.ExternalPlugins == nil && other != nil {
+		c.ExternalPlugins = make(map[string][]ExternalPlugin)
+	}
+
+	var errs []error
+	for orgOrRepo, config := range other {
+		if _, ok := c.ExternalPlugins[orgOrRepo]; ok {
+			errs = append(errs, fmt.Errorf("found duplicate config for external-plugins.%s", orgOrRepo))
+			continue
+		}
+		c.ExternalPlugins[orgOrRepo] = config
+	}
+
+	return utilerrors.NewAggregate(errs)
+}
+
+func (p *Plugins) mergeFrom(other *Plugins) error {
+	if other == nil {
+		return nil
+	}
+	if len(*p) == 0 {
+		*p = *other
+		return nil
+	}
+
+	var errs []error
+	for orgOrRepo, config := range *other {
+		if _, ok := (*p)[orgOrRepo]; ok {
+			errs = append(errs, fmt.Errorf("found duplicate config for plugins.%s", orgOrRepo))
+			continue
+		}
+		(*p)[orgOrRepo] = config
+	}
+
+	return utilerrors.NewAggregate(errs)
+}
+
+func (p *Bugzilla) mergeFrom(other *Bugzilla) error {
+	if other == nil {
+		return nil
+	}
+
+	var errs []error
+	if other.Default != nil {
+		if p.Default != nil {
+			errs = append(errs, errors.New("configuration of global default defined in multiple places"))
+		} else {
+			p.Default = other.Default
+		}
+	}
+	if len(other.Orgs) != 0 && p.Orgs == nil {
+		p.Orgs = make(map[string]BugzillaOrgOptions)
+	}
+	for org, orgConfig := range other.Orgs {
+		if _, ok := p.Orgs[org]; !ok {
+			p.Orgs[org] = BugzillaOrgOptions{}
+		}
+		if orgConfig.Default != nil {
+			if p.Orgs[org].Default != nil {
+				errs = append(errs, fmt.Errorf("found duplicate organization config for bugzilla.%s", org))
+				continue
+			}
+			newConfig := p.Orgs[org]
+			newConfig.Default = orgConfig.Default
+			p.Orgs[org] = newConfig
+		}
+		if len(orgConfig.Repos) != 0 && p.Orgs[org].Repos == nil {
+			newConfig := p.Orgs[org]
+			newConfig.Repos = make(map[string]BugzillaRepoOptions)
+			p.Orgs[org] = newConfig
+		}
+		for repo, repoConfig := range orgConfig.Repos {
+			if _, ok := p.Orgs[org].Repos[repo]; ok {
+				errs = append(errs, fmt.Errorf("found duplicate repository config for bugzilla.%s/%s", org, repo))
+				continue
+			}
+			p.Orgs[org].Repos[repo] = repoConfig
+		}
+	}
+	return utilerrors.NewAggregate(errs)
+}
+
+func (c *Configuration) HasConfigFor() (global bool, orgs sets.String, repos sets.String) {
+	if !reflect.DeepEqual(c, &Configuration{Approve: c.Approve, Bugzilla: c.Bugzilla, ExternalPlugins: c.ExternalPlugins, Lgtm: c.Lgtm, Plugins: c.Plugins}) || c.Bugzilla.Default != nil {
+		global = true
+	}
+	orgs = sets.String{}
+	repos = sets.String{}
+	for orgOrRepo := range c.Plugins {
+		if strings.Contains(orgOrRepo, "/") {
+			repos.Insert(orgOrRepo)
+		} else {
+			orgs.Insert(orgOrRepo)
+		}
+	}
+
+	for org, orgConfig := range c.Bugzilla.Orgs {
+		if orgConfig.Default != nil {
+			orgs.Insert(org)
+		}
+		for repo := range orgConfig.Repos {
+			repos.Insert(org + "/" + repo)
+		}
+	}
+
+	for _, approveConfig := range c.Approve {
+		for _, orgOrRepo := range approveConfig.Repos {
+			if strings.Contains(orgOrRepo, "/") {
+				repos.Insert(orgOrRepo)
+			} else {
+				orgs.Insert(orgOrRepo)
+			}
+		}
+	}
+
+	for _, lgtm := range c.Lgtm {
+		for _, orgOrRepo := range lgtm.Repos {
+			if strings.Contains(orgOrRepo, "/") {
+				repos.Insert(orgOrRepo)
+			} else {
+				orgs.Insert(orgOrRepo)
+			}
+		}
+	}
+
+	for orgOrRepo := range c.ExternalPlugins {
+		if strings.Contains(orgOrRepo, "/") {
+			repos.Insert(orgOrRepo)
+		} else {
+			orgs.Insert(orgOrRepo)
+		}
+	}
+
+	return global, orgs, repos
 }

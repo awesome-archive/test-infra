@@ -21,13 +21,14 @@ import (
 	"errors"
 	"fmt"
 	"mime"
+	"net/url"
 	"strings"
 	"time"
 
-	buildv1alpha1 "github.com/knative/build/pkg/apis/build/v1alpha1"
 	pipelinev1alpha1 "github.com/tektoncd/pipeline/pkg/apis/pipeline/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
 	prowgithub "k8s.io/test-infra/prow/github"
 )
 
@@ -53,7 +54,7 @@ type ProwJobState string
 const (
 	// TriggeredState means the job has been created but not yet scheduled.
 	TriggeredState ProwJobState = "triggered"
-	// PendingState means the job is scheduled but not yet running.
+	// PendingState means the job is currently running and we are waiting for it to finish.
 	PendingState ProwJobState = "pending"
 	// SuccessState means the job completed without error (exit 0)
 	SuccessState ProwJobState = "success"
@@ -73,8 +74,6 @@ const (
 	KubernetesAgent ProwJobAgent = "kubernetes"
 	// JenkinsAgent means prow will schedule the job on jenkins.
 	JenkinsAgent ProwJobAgent = "jenkins"
-	// KnativeBuildAgent means prow will schedule the job via a build-crd resource.
-	KnativeBuildAgent ProwJobAgent = "knative-build"
 	// TektonAgent means prow will schedule the job via a tekton PipelineRun CRD resource.
 	TektonAgent = "tekton-pipeline"
 )
@@ -82,6 +81,19 @@ const (
 const (
 	// DefaultClusterAlias specifies the default cluster key to schedule jobs.
 	DefaultClusterAlias = "default"
+)
+
+const (
+	// StartedStatusFile is the JSON file that stores information about the build
+	// at the start ob the build. See testgrid/metadata/job.go for more details.
+	StartedStatusFile = "started.json"
+
+	// FinishedStatusFile is the JSON file that stores information about the build
+	// after its completion. See testgrid/metadata/job.go for more details.
+	FinishedStatusFile = "finished.json"
+
+	// ProwJobFile is the JSON file that stores the prowjob information.
+	ProwJobFile = "prowjob.json"
 )
 
 // +genclient
@@ -122,7 +134,7 @@ type ProwJobSpec struct {
 	// need to be cloned, determined from config
 	ExtraRefs []Refs `json:"extra_refs,omitempty"`
 	// Report determines if the result of this job should
-	// be posted as a status on GitHub
+	// be reported (e.g. status on GitHub, message in Slack, etc.)
 	Report bool `json:"report,omitempty"`
 	// Context is the name of the status context used to
 	// report back to GitHub
@@ -143,11 +155,6 @@ type ProwJobSpec struct {
 	// a Kubernetes agent
 	PodSpec *corev1.PodSpec `json:"pod_spec,omitempty"`
 
-	// BuildSpec provides the basis for running the test as
-	// a build-crd resource
-	// https://github.com/knative/build
-	BuildSpec *buildv1alpha1.BuildSpec `json:"build_spec,omitempty"`
-
 	// JenkinsSpec holds configuration specific to Jenkins jobs
 	JenkinsSpec *JenkinsSpec `json:"jenkins_spec,omitempty"`
 
@@ -164,7 +171,7 @@ type ProwJobSpec struct {
 	ReporterConfig *ReporterConfig `json:"reporter_config,omitempty"`
 
 	// RerunAuthConfig holds information about which users can rerun the job
-	RerunAuthConfig RerunAuthConfig `json:"rerun_auth_config,omitempty"`
+	RerunAuthConfig *RerunAuthConfig `json:"rerun_auth_config,omitempty"`
 
 	// Hidden specifies if the Job is considered hidden.
 	// Hidden jobs are only shown by deck instances that have the
@@ -172,6 +179,10 @@ type ProwJobSpec struct {
 	// Presubmits and Postsubmits can also be set to hidden by
 	// adding their repository in Decks `hidden_repo` setting.
 	Hidden bool `json:"hidden,omitempty"`
+
+	// ProwJobDefault holds configuration options provided as defaults
+	// in the Prow config
+	ProwJobDefault *ProwJobDefault `json:"prowjob_defaults,omitempty"`
 }
 
 type GitHubTeamSlug struct {
@@ -193,11 +204,16 @@ type RerunAuthConfig struct {
 	GitHubTeamSlugs []GitHubTeamSlug `json:"github_team_slugs,omitempty"`
 	// GitHubUsers contains names of individual users who can rerun the job
 	GitHubUsers []string `json:"github_users,omitempty"`
+	// GitHubOrgs contains names of GitHub organizations whose members can rerun the job
+	GitHubOrgs []string `json:"github_orgs,omitempty"`
 }
 
 // IsSpecifiedUser returns true if AllowAnyone is set to true or if the given user is
 // specified as a permitted GitHubUser
-func (rac *RerunAuthConfig) IsAuthorized(user string, cli prowgithub.RerunClient) (bool, error) {
+func (rac *RerunAuthConfig) IsAuthorized(org, user string, cli prowgithub.RerunClient) (bool, error) {
+	if rac == nil {
+		return false, nil
+	}
 	if rac.AllowAnyone {
 		return true, nil
 	}
@@ -210,8 +226,17 @@ func (rac *RerunAuthConfig) IsAuthorized(user string, cli prowgithub.RerunClient
 	if cli == nil {
 		return false, nil
 	}
+	for _, gho := range rac.GitHubOrgs {
+		isOrgMember, err := cli.IsMember(gho, user)
+		if err != nil {
+			return false, fmt.Errorf("GitHub failed to fetch members of org %v: %v", gho, err)
+		}
+		if isOrgMember {
+			return true, nil
+		}
+	}
 	for _, ght := range rac.GitHubTeamIDs {
-		member, err := cli.TeamHasMember(ght, user)
+		member, err := cli.TeamHasMember(org, ght, user)
 		if err != nil {
 			return false, fmt.Errorf("GitHub failed to fetch members of team %v, verify that you have the correct team number and access token: %v", ght, err)
 		}
@@ -224,7 +249,7 @@ func (rac *RerunAuthConfig) IsAuthorized(user string, cli prowgithub.RerunClient
 		if err != nil {
 			return false, fmt.Errorf("GitHub failed to fetch team with slug %s and org %s: %v", ghts.Slug, ghts.Org, err)
 		}
-		member, err := cli.TeamHasMember(team.ID, user)
+		member, err := cli.TeamHasMember(org, team.ID, user)
 		if err != nil {
 			return false, fmt.Errorf("GitHub failed to fetch members of team %v: %v", team, err)
 		}
@@ -235,12 +260,69 @@ func (rac *RerunAuthConfig) IsAuthorized(user string, cli prowgithub.RerunClient
 	return false, nil
 }
 
+// Validate validates the RerunAuthConfig fields.
+func (rac *RerunAuthConfig) Validate() error {
+	if rac == nil {
+		return nil
+	}
+
+	hasAllowList := len(rac.GitHubUsers) > 0 || len(rac.GitHubTeamIDs) > 0 || len(rac.GitHubTeamSlugs) > 0 || len(rac.GitHubOrgs) > 0
+
+	// If an allowlist is specified, the user probably does not intend for anyone to be able to rerun any job.
+	if rac.AllowAnyone && hasAllowList {
+		return errors.New("allow anyone is set to true and permitted users or groups are specified")
+	}
+
+	return nil
+}
+
+// IsAllowAnyone checks if anyone can rerun the job.
+func (rac *RerunAuthConfig) IsAllowAnyone() bool {
+	if rac == nil {
+		return false
+	}
+
+	return rac.AllowAnyone
+}
+
 type ReporterConfig struct {
 	Slack *SlackReporterConfig `json:"slack,omitempty"`
 }
 
 type SlackReporterConfig struct {
-	Channel string `json:"channel"`
+	Host              string         `json:"host,omitempty"`
+	Channel           string         `json:"channel,omitempty"`
+	JobStatesToReport []ProwJobState `json:"job_states_to_report"`
+	ReportTemplate    string         `json:"report_template,omitempty"`
+}
+
+func (src *SlackReporterConfig) ApplyDefault(def *SlackReporterConfig) *SlackReporterConfig {
+	if src == nil && def == nil {
+		return nil
+	}
+	var merged SlackReporterConfig
+	if src != nil {
+		merged = *src.DeepCopy()
+	} else {
+		merged = *def.DeepCopy()
+	}
+	if src == nil || def == nil {
+		return &merged
+	}
+
+	if merged.Channel == "" {
+		merged.Channel = def.Channel
+	}
+	if merged.Host == "" {
+		merged.Host = def.Host
+	}
+	if merged.JobStatesToReport == nil {
+		merged.JobStatesToReport = def.JobStatesToReport
+	}
+	if merged.ReportTemplate == "" {
+		merged.ReportTemplate = def.ReportTemplate
+	}
+	return &merged
 }
 
 // Duration is a wrapper around time.Duration that parses times in either
@@ -275,6 +357,12 @@ func (d *Duration) MarshalJSON() ([]byte, error) {
 	return json.Marshal(d.Duration.String())
 }
 
+// ProwJobDefault is used for Prowjob fields we want to set as defaults
+// in Prow config
+type ProwJobDefault struct {
+	TenantID string `json:"tenant_id,omitempty"`
+}
+
 // DecorationConfig specifies how to augment pods.
 //
 // This is primarily used to provide automatic integration with gubernator
@@ -291,12 +379,21 @@ type DecorationConfig struct {
 	// UtilityImages holds pull specs for utility container
 	// images used to decorate a PodSpec.
 	UtilityImages *UtilityImages `json:"utility_images,omitempty"`
+	// Resources holds resource requests and limits for utility
+	// containers used to decorate a PodSpec.
+	Resources *Resources `json:"resources,omitempty"`
 	// GCSConfiguration holds options for pushing logs and
 	// artifacts to GCS from a job.
 	GCSConfiguration *GCSConfiguration `json:"gcs_configuration,omitempty"`
 	// GCSCredentialsSecret is the name of the Kubernetes secret
 	// that holds GCS push credentials.
-	GCSCredentialsSecret string `json:"gcs_credentials_secret,omitempty"`
+	GCSCredentialsSecret *string `json:"gcs_credentials_secret,omitempty"`
+	// S3CredentialsSecret is the name of the Kubernetes secret
+	// that holds blob storage push credentials.
+	S3CredentialsSecret *string `json:"s3_credentials_secret,omitempty"`
+	// DefaultServiceAccountName is the name of the Kubernetes service account
+	// that should be used by the pod if one is not specified in the podspec.
+	DefaultServiceAccountName *string `json:"default_service_account_name,omitempty"`
 	// SSHKeySecrets are the names of Kubernetes secrets that contain
 	// SSK keys which should be used during the cloning process.
 	SSHKeySecrets []string `json:"ssh_key_secrets,omitempty"`
@@ -309,7 +406,145 @@ type DecorationConfig struct {
 	SkipCloning *bool `json:"skip_cloning,omitempty"`
 	// CookieFileSecret is the name of a kubernetes secret that contains
 	// a git http.cookiefile, which should be used during the cloning process.
-	CookiefileSecret string `json:"cookiefile_secret,omitempty"`
+	CookiefileSecret *string `json:"cookiefile_secret,omitempty"`
+	// OauthTokenSecret is a Kubernetes secret that contains the OAuth token,
+	// which is going to be used for fetching a private repository.
+	OauthTokenSecret *OauthTokenSecret `json:"oauth_token_secret,omitempty"`
+
+	// CensorSecrets enables censoring output logs and artifacts.
+	CensorSecrets *bool `json:"censor_secrets,omitempty"`
+
+	// CensoringOptions exposes options for censoring output logs and artifacts.
+	CensoringOptions *CensoringOptions `json:"censoring_options,omitempty"`
+
+	// UploadIgnoresInterrupts causes sidecar to ignore interrupts for the upload process in
+	// hope that the test process exits cleanly before starting an upload.
+	UploadIgnoresInterrupts *bool `json:"upload_ignores_interrupts,omitempty"`
+}
+
+type CensoringOptions struct {
+	// CensoringConcurrency is the maximum number of goroutines that should be censoring
+	// artifacts and logs at any time. If unset, defaults to 10.
+	CensoringConcurrency *int64 `json:"censoring_concurrency,omitempty"`
+	// CensoringBufferSize is the size in bytes of the buffer allocated for every file
+	// being censored. We want to keep as little of the file in memory as possible in
+	// order for censoring to be reasonably performant in space. However, to guarantee
+	// that we censor every instance of every secret, our buffer size must be at least
+	// two times larger than the largest secret we are about to censor. While that size
+	// is the smallest possible buffer we could use, if the secrets being censored are
+	// small, censoring will not be performant as the number of I/O actions per file
+	// would increase. If unset, defaults to 10MiB.
+	CensoringBufferSize *int `json:"censoring_buffer_size,omitempty"`
+
+	// IncludeDirectories are directories which should have their content censored. If
+	// present, only content in these directories will be censored. Entries in this list
+	// are relative to $ARTIFACTS and are parsed with the go-zglob library, allowing for
+	// globbed matches.
+	IncludeDirectories []string `json:"include_directories,omitempty"`
+
+	// ExcludeDirectories are directories which should not have their content censored. If
+	// present, content in these directories will not be censored even if the directory also
+	// matches a glob in IncludeDirectories. Entries in this list are relative to $ARTIFACTS,
+	// and are parsed with the go-zglob library, allowing for globbed matches.
+	ExcludeDirectories []string `json:"exclude_directories,omitempty"`
+}
+
+// ApplyDefault applies the defaults for CensoringOptions decorations. If a field has a zero value,
+// it replaces that with the value set in def.
+func (g *CensoringOptions) ApplyDefault(def *CensoringOptions) *CensoringOptions {
+	if g == nil && def == nil {
+		return nil
+	}
+	var merged CensoringOptions
+	if g != nil {
+		merged = *g.DeepCopy()
+	} else {
+		merged = *def.DeepCopy()
+	}
+	if g == nil || def == nil {
+		return &merged
+	}
+
+	if merged.CensoringConcurrency == nil {
+		merged.CensoringConcurrency = def.CensoringConcurrency
+	}
+
+	if merged.CensoringBufferSize == nil {
+		merged.CensoringBufferSize = def.CensoringBufferSize
+	}
+
+	if merged.IncludeDirectories == nil {
+		merged.IncludeDirectories = def.IncludeDirectories
+	}
+
+	if merged.ExcludeDirectories == nil {
+		merged.ExcludeDirectories = def.ExcludeDirectories
+	}
+	return &merged
+
+}
+
+// Resources holds resource requests and limits for
+// containers used to decorate a PodSpec
+type Resources struct {
+	CloneRefs       *corev1.ResourceRequirements `json:"clonerefs,omitempty"`
+	InitUpload      *corev1.ResourceRequirements `json:"initupload,omitempty"`
+	PlaceEntrypoint *corev1.ResourceRequirements `json:"place_entrypoint,omitempty"`
+	Sidecar         *corev1.ResourceRequirements `json:"sidecar,omitempty"`
+}
+
+// ApplyDefault applies the defaults for the resource decorations. If a field has a zero value,
+// it replaces that with the value set in def.
+func (u *Resources) ApplyDefault(def *Resources) *Resources {
+	if u == nil {
+		return def
+	} else if def == nil {
+		return u
+	}
+
+	merged := *u
+	if merged.CloneRefs == nil {
+		merged.CloneRefs = def.CloneRefs
+	}
+	if merged.InitUpload == nil {
+		merged.InitUpload = def.InitUpload
+	}
+	if merged.PlaceEntrypoint == nil {
+		merged.PlaceEntrypoint = def.PlaceEntrypoint
+	}
+	if merged.Sidecar == nil {
+		merged.Sidecar = def.Sidecar
+	}
+	return &merged
+}
+
+// OauthTokenSecret holds the information of the oauth token's secret name and key.
+type OauthTokenSecret struct {
+	// Name is the name of a kubernetes secret.
+	Name string `json:"name,omitempty"`
+	// Key is the a key of the corresponding kubernetes secret that
+	// holds the value of the OAuth token.
+	Key string `json:"key,omitempty"`
+}
+
+func (d *ProwJobDefault) ApplyDefault(def *ProwJobDefault) *ProwJobDefault {
+	if d == nil && def == nil {
+		return nil
+	}
+	var merged ProwJobDefault
+	if d != nil {
+		merged = *d.DeepCopy()
+	} else {
+		merged = *def.DeepCopy()
+	}
+	if d == nil || def == nil {
+		return &merged
+	}
+	if merged.TenantID == "" {
+		merged.TenantID = def.TenantID
+	}
+
+	return &merged
 }
 
 // ApplyDefault applies the defaults for the ProwJob decoration. If a field has a zero value, it
@@ -320,15 +555,17 @@ func (d *DecorationConfig) ApplyDefault(def *DecorationConfig) *DecorationConfig
 	}
 	var merged DecorationConfig
 	if d != nil {
-		merged = *d
+		merged = *d.DeepCopy()
 	} else {
-		merged = *def
+		merged = *def.DeepCopy()
 	}
 	if d == nil || def == nil {
 		return &merged
 	}
 	merged.UtilityImages = merged.UtilityImages.ApplyDefault(def.UtilityImages)
+	merged.Resources = merged.Resources.ApplyDefault(def.Resources)
 	merged.GCSConfiguration = merged.GCSConfiguration.ApplyDefault(def.GCSConfiguration)
+	merged.CensoringOptions = merged.CensoringOptions.ApplyDefault(def.CensoringOptions)
 
 	if merged.Timeout == nil {
 		merged.Timeout = def.Timeout
@@ -336,8 +573,14 @@ func (d *DecorationConfig) ApplyDefault(def *DecorationConfig) *DecorationConfig
 	if merged.GracePeriod == nil {
 		merged.GracePeriod = def.GracePeriod
 	}
-	if merged.GCSCredentialsSecret == "" {
+	if merged.GCSCredentialsSecret == nil {
 		merged.GCSCredentialsSecret = def.GCSCredentialsSecret
+	}
+	if merged.S3CredentialsSecret == nil {
+		merged.S3CredentialsSecret = def.S3CredentialsSecret
+	}
+	if merged.DefaultServiceAccountName == nil {
+		merged.DefaultServiceAccountName = def.DefaultServiceAccountName
 	}
 	if len(merged.SSHKeySecrets) == 0 {
 		merged.SSHKeySecrets = def.SSHKeySecrets
@@ -348,8 +591,18 @@ func (d *DecorationConfig) ApplyDefault(def *DecorationConfig) *DecorationConfig
 	if merged.SkipCloning == nil {
 		merged.SkipCloning = def.SkipCloning
 	}
-	if merged.CookiefileSecret == "" {
+	if merged.CookiefileSecret == nil {
 		merged.CookiefileSecret = def.CookiefileSecret
+	}
+	if merged.OauthTokenSecret == nil {
+		merged.OauthTokenSecret = def.OauthTokenSecret
+	}
+	if merged.CensorSecrets == nil {
+		merged.CensorSecrets = def.CensorSecrets
+	}
+
+	if merged.UploadIgnoresInterrupts == nil {
+		merged.UploadIgnoresInterrupts = def.UploadIgnoresInterrupts
 	}
 
 	return &merged
@@ -380,11 +633,15 @@ func (d *DecorationConfig) Validate() error {
 	if d.GCSConfiguration == nil {
 		return errors.New("GCS upload configuration is not specified")
 	}
-	if d.GCSCredentialsSecret == "" {
-		return errors.New("GCS upload credential secret is not specified")
-	}
+	// Intentionally allow d.GCSCredentialsSecret and d.S3CredentialsSecret to
+	// be unset in which case we assume GCS permissions are provided by GKE
+	// Workload Identity: https://cloud.google.com/kubernetes-engine/docs/how-to/workload-identity
+
 	if err := d.GCSConfiguration.Validate(); err != nil {
 		return fmt.Errorf("GCS configuration is invalid: %v", err)
+	}
+	if d.OauthTokenSecret != nil && len(d.SSHKeySecrets) > 0 {
+		return errors.New("both OAuth token and SSH key secrets are specified")
 	}
 	return nil
 }
@@ -418,7 +675,7 @@ func (u *UtilityImages) ApplyDefault(def *UtilityImages) *UtilityImages {
 		return u
 	}
 
-	merged := *u
+	merged := *u.DeepCopy()
 	if merged.CloneRefs == "" {
 		merged.CloneRefs = def.CloneRefs
 	}
@@ -445,7 +702,10 @@ const (
 // GCSConfiguration holds options for pushing logs and
 // artifacts to GCS from a job.
 type GCSConfiguration struct {
-	// Bucket is the GCS bucket to upload to
+	// Bucket is the bucket to upload to, it can be:
+	// * a GCS bucket: with gs:// prefix
+	// * a S3 bucket: with s3:// prefix
+	// * a GCS bucket: without a prefix (deprecated, it's discouraged to use Bucket without prefix please add the gs:// prefix)
 	Bucket string `json:"bucket,omitempty"`
 	// PathPrefix is an optional path that follows the
 	// bucket name and comes before any structure
@@ -463,8 +723,11 @@ type GCSConfiguration struct {
 	// builtin's and the local system's defaults.  This maps extensions
 	// to media types, for example: MediaTypes["log"] = "text/plain"
 	MediaTypes map[string]string `json:"mediaTypes,omitempty"`
+	// JobURLPrefix holds the baseURL under which the jobs output can be viewed.
+	// If unset, this will be derived based on org/repo from the job_url_prefix_config.
+	JobURLPrefix string `json:"job_url_prefix,omitempty"`
 
-	// LocalOutputDir specifies a directory where files should be copied INSTEAD of uploading to GCS.
+	// LocalOutputDir specifies a directory where files should be copied INSTEAD of uploading to blob storage.
 	// This option is useful for testing jobs that use the pod-utilities without actually uploading.
 	LocalOutputDir string `json:"local_output_dir,omitempty"`
 }
@@ -477,9 +740,9 @@ func (g *GCSConfiguration) ApplyDefault(def *GCSConfiguration) *GCSConfiguration
 	}
 	var merged GCSConfiguration
 	if g != nil {
-		merged = *g
+		merged = *g.DeepCopy()
 	} else {
-		merged = *def
+		merged = *def.DeepCopy()
 	}
 	if g == nil || def == nil {
 		return &merged
@@ -501,11 +764,16 @@ func (g *GCSConfiguration) ApplyDefault(def *GCSConfiguration) *GCSConfiguration
 		merged.DefaultRepo = def.DefaultRepo
 	}
 
+	if merged.MediaTypes == nil && len(def.MediaTypes) > 0 {
+		merged.MediaTypes = map[string]string{}
+	}
+
 	for extension, mediaType := range def.MediaTypes {
 		merged.MediaTypes[extension] = mediaType
 	}
-	for extension, mediaType := range g.MediaTypes {
-		merged.MediaTypes[extension] = mediaType
+
+	if merged.JobURLPrefix == "" {
+		merged.JobURLPrefix = def.JobURLPrefix
 	}
 
 	if merged.LocalOutputDir == "" {
@@ -516,6 +784,9 @@ func (g *GCSConfiguration) ApplyDefault(def *GCSConfiguration) *GCSConfiguration
 
 // Validate ensures all the values set in the GCSConfiguration are valid.
 func (g *GCSConfiguration) Validate() error {
+	if _, err := ParsePath(g.Bucket); err != nil {
+		return err
+	}
 	for _, mediaType := range g.MediaTypes {
 		if _, _, err := mime.ParseMediaType(mediaType); err != nil {
 			return fmt.Errorf("invalid extension media type %q: %v", mediaType, err)
@@ -530,9 +801,43 @@ func (g *GCSConfiguration) Validate() error {
 	return nil
 }
 
+type ProwPath url.URL
+
+func (pp ProwPath) StorageProvider() string {
+	return pp.Scheme
+}
+
+func (pp ProwPath) Bucket() string {
+	return pp.Host
+}
+
+func (pp ProwPath) FullPath() string {
+	return pp.Host + pp.Path
+}
+
+// ParsePath tries to extract the ProwPath from, e.g.:
+// * <bucket-name> (storageProvider gs)
+// * <storage-provider>://<bucket-name>
+func ParsePath(bucket string) (*ProwPath, error) {
+	// default to GCS if no storage-provider is specified
+	if !strings.Contains(bucket, "://") {
+		bucket = "gs://" + bucket
+	}
+	parsedBucket, err := url.Parse(bucket)
+	if err != nil {
+		return nil, fmt.Errorf("path %q has invalid format, expected either <bucket-name>[/<path>] or <storage-provider>://<bucket-name>[/<path>]", bucket)
+	}
+	pp := ProwPath(*parsedBucket)
+	return &pp, nil
+}
+
 // ProwJobStatus provides runtime metadata, such as when it finished, whether it is running, etc.
 type ProwJobStatus struct {
-	StartTime      metav1.Time  `json:"startTime,omitempty"`
+	// StartTime is equal to the creation time of the ProwJob
+	StartTime metav1.Time `json:"startTime,omitempty"`
+	// PendingTime is the timestamp for when the job moved from triggered to pending
+	PendingTime *metav1.Time `json:"pendingTime,omitempty"`
+	// CompletionTime is the timestamp for when the job goes to a final state
 	CompletionTime *metav1.Time `json:"completionTime,omitempty"`
 	State          ProwJobState `json:"state,omitempty"`
 	Description    string       `json:"description,omitempty"`
@@ -636,11 +941,15 @@ type Refs struct {
 	// `https://github.com/org/repo.git`.
 	CloneURI string `json:"clone_uri,omitempty"`
 	// SkipSubmodules determines if submodules should be
-	// cloned when the job is run. Defaults to true.
+	// cloned when the job is run. Defaults to false.
 	SkipSubmodules bool `json:"skip_submodules,omitempty"`
 	// CloneDepth is the depth of the clone that will be used.
 	// A depth of zero will do a full clone.
 	CloneDepth int `json:"clone_depth,omitempty"`
+	// SkipFetchHead tells prow to avoid a git fetch <remote> call.
+	// Multiheaded repos may need to not make this call.
+	// The git fetch <remote> <BaseRef> call occurs regardless.
+	SkipFetchHead bool `json:"skip_fetch_head,omitempty"`
 }
 
 func (r Refs) String() string {

@@ -18,10 +18,11 @@ package config
 
 import (
 	"fmt"
+	"net/url"
 	"regexp"
+	"strings"
 	"time"
 
-	buildv1alpha1 "github.com/knative/build/pkg/apis/build/v1alpha1"
 	pipelinev1alpha1 "github.com/tektoncd/pipeline/pkg/apis/pipeline/v1alpha1"
 
 	v1 "k8s.io/api/core/v1"
@@ -30,8 +31,12 @@ import (
 	"k8s.io/test-infra/prow/github"
 )
 
-// Preset is intended to match the k8s' PodPreset feature, and may be removed
-// if that feature goes beta.
+const (
+	schemeHTTP  = "http"
+	schemeHTTPS = "https"
+)
+
+// Presets can be used to re-use settings across multiple jobs.
 type Preset struct {
 	Labels       map[string]string `json:"labels"`
 	Env          []v1.EnvVar       `json:"env"`
@@ -103,8 +108,6 @@ type JobBase struct {
 	SourcePath string `json:"-"`
 	// Spec is the Kubernetes pod spec used if Agent is kubernetes.
 	Spec *v1.PodSpec `json:"spec,omitempty"`
-	// BuildSpec is the Knative build spec used if Agent is knative-build.
-	BuildSpec *buildv1alpha1.BuildSpec `json:"build_spec,omitempty"`
 	// PipelineRunSpec is the tekton pipeline spec used if Agent is tekton-pipeline.
 	PipelineRunSpec *pipelinev1alpha1.PipelineRunSpec `json:"pipeline_run_spec,omitempty"`
 	// Annotations are unused by prow itself, but provide a space to configure other automation.
@@ -118,6 +121,9 @@ type JobBase struct {
 	// Presubmits and Postsubmits can also be set to hidden by
 	// adding their repository in Decks `hidden_repo` setting.
 	Hidden bool `json:"hidden,omitempty"`
+	// ProwJobDefault holds configuration options provided as defaults
+	// in the Prow config
+	ProwJobDefault *prowapi.ProwJobDefault `json:"prowjob_defaults,omitempty"`
 
 	UtilityConfig
 }
@@ -158,6 +164,17 @@ type Presubmit struct {
 // Postsubmit runs on push events.
 type Postsubmit struct {
 	JobBase
+
+	// AlwaysRun determines whether we should try to run this job it (or not run
+	// it). The key difference with the AlwaysRun field for Presubmits is that
+	// here, we essentially treat "true" as the default value as Postsubmits by
+	// default run unless there is some falsifying condition.
+	//
+	// The use of a pointer allows us to check if the field was or was not
+	// provided by the user. This is required because otherwise when we
+	// Unmarshal() the bytes into this struct, we'll get a default "false" value
+	// if this field is not provided, which is the opposite of what we want.
+	AlwaysRun *bool `json:"always_run,omitempty"`
 
 	RegexpChangeMatcher
 
@@ -217,8 +234,12 @@ type Brancher struct {
 type RegexpChangeMatcher struct {
 	// RunIfChanged defines a regex used to select which subset of file changes should trigger this job.
 	// If any file in the changeset matches this regex, the job will be triggered
-	RunIfChanged string         `json:"run_if_changed,omitempty"`
-	reChanges    *regexp.Regexp // from RunIfChanged
+	RunIfChanged string `json:"run_if_changed,omitempty"`
+	// SkipIfOnlyChanged defines a regex used to select which subset of file changes should trigger this job.
+	// If all files in the changeset match this regex, the job will be skipped.
+	// In other words, this is the negation of RunIfChanged.
+	SkipIfOnlyChanged string         `json:"skip_if_only_changed,omitempty"`
+	reChanges         *regexp.Regexp // from RunIfChanged xor SkipIfOnlyChanged
 }
 
 type Reporter struct {
@@ -234,7 +255,7 @@ func (br Brancher) RunsAgainstAllBranch() bool {
 	return len(br.SkipBranches) == 0 && len(br.Branches) == 0
 }
 
-// ShouldRun returns true if the input branch matches, given the whitelist/blacklist.
+// ShouldRun returns true if the input branch matches, given the allow/deny list.
 func (br Brancher) ShouldRun(branch string) bool {
 	if br.RunsAgainstAllBranch() {
 		return true
@@ -259,10 +280,7 @@ func (br Brancher) Intersects(other Brancher) bool {
 		baseBranches := sets.NewString(br.Branches...)
 		if len(other.Branches) > 0 {
 			otherBranches := sets.NewString(other.Branches...)
-			if baseBranches.Intersection(otherBranches).Len() > 0 {
-				return true
-			}
-			return false
+			return baseBranches.Intersection(otherBranches).Len() > 0
 		}
 
 		// Actually test our branches against the other brancher - if there are regex skip lists, simple comparison
@@ -283,7 +301,7 @@ func (br Brancher) Intersects(other Brancher) bool {
 
 // CouldRun determines if its possible for a set of changes to trigger this condition
 func (cm RegexpChangeMatcher) CouldRun() bool {
-	return cm.RunIfChanged != ""
+	return cm.RunIfChanged != "" || cm.SkipIfOnlyChanged != ""
 }
 
 // ShouldRun determines if we can know for certain that the job should run. We can either
@@ -300,10 +318,15 @@ func (cm RegexpChangeMatcher) ShouldRun(changes ChangedFilesProvider) (determine
 	return false, false, nil
 }
 
-// RunsAgainstChanges returns true if any of the changed input paths match the run_if_changed regex.
+// RunsAgainstChanges returns true if any of the changed input paths match the run_if_changed regex;
+// OR if any of the changed input paths *don't* match the skip_if_only_changed regex.
 func (cm RegexpChangeMatcher) RunsAgainstChanges(changes []string) bool {
 	for _, change := range changes {
-		if cm.reChanges.MatchString(change) {
+		// RunIfChanged triggers the run if *any* change matches the supplied regex.
+		if cm.RunIfChanged != "" && cm.reChanges.MatchString(change) {
+			return true
+			// SkipIfOnlyChanged triggers the run if any change *doesn't* match the supplied regex.
+		} else if cm.SkipIfOnlyChanged != "" && !cm.reChanges.MatchString(change) {
 			return true
 		}
 	}
@@ -322,12 +345,26 @@ func (ps Postsubmit) ShouldRun(baseRef string, changes ChangedFilesProvider) (bo
 	if !ps.CouldRun(baseRef) {
 		return false, nil
 	}
+
+	// Consider `run_if_changed` or `skip_if_only_changed` rules.
 	if determined, shouldRun, err := ps.RegexpChangeMatcher.ShouldRun(changes); err != nil {
 		return false, err
 	} else if determined {
 		return shouldRun, nil
 	}
-	// Postsubmits default to always run
+
+	// At this point neither `run_if_changed` nor `skip_if_only_changed` were
+	// set. We're left with 2 cases: (1) `always_run: ...` was provided
+	// explicitly, or (2) this field was not defined in the job at all. In the
+	// second case, we default to "true".
+
+	// If the `always_run` field was explicitly set, return it.
+	if ps.AlwaysRun != nil {
+		return *ps.AlwaysRun, nil
+	}
+
+	// Postsubmits default to always run. This is the case if `always_run` was
+	// not explicitly set.
 	return true, nil
 }
 
@@ -350,12 +387,8 @@ func (ps Presubmit) ShouldRun(baseRef string, changes ChangedFilesProvider, forc
 	if forced {
 		return true, nil
 	}
-	if determined, shouldRun, err := ps.RegexpChangeMatcher.ShouldRun(changes); err != nil {
-		return false, err
-	} else if determined {
-		return shouldRun, nil
-	}
-	return defaults, nil
+	determined, shouldRun, err := ps.RegexpChangeMatcher.ShouldRun(changes)
+	return (determined && shouldRun) || defaults, err
 }
 
 // TriggersConditionally determines if the presubmit triggers conditionally (if it may or may not trigger).
@@ -388,8 +421,8 @@ type githubClient interface {
 }
 
 // NewGitHubDeferredChangedFilesProvider uses a closure to lazily retrieve the file changes only if they are needed.
-// We only have to fetch the changes if there is at least one RunIfChanged job that is not being force run (due to
-// a `/retest` after a failure or because it is explicitly triggered with `/test foo`).
+// We only have to fetch the changes if there is at least one RunIfChanged/SkipIfOnlyChanged job that is not being
+// force run (due to a `/retest` after a failure or because it is explicitly triggered with `/test foo`).
 func NewGitHubDeferredChangedFilesProvider(client githubClient, org, repo string, num int) ChangedFilesProvider {
 	var changedFiles []string
 	return func() ([]string, error) {
@@ -410,7 +443,7 @@ func NewGitHubDeferredChangedFilesProvider(client githubClient, org, repo string
 // UtilityConfig holds decoration metadata, such as how to clone and additional containers/etc
 type UtilityConfig struct {
 	// Decorate determines if we decorate the PodSpec or not
-	Decorate bool `json:"decorate,omitempty"`
+	Decorate *bool `json:"decorate,omitempty"`
 
 	// PathAlias is the location under <root-dir>/src
 	// where the repository under test is cloned. If this
@@ -422,11 +455,14 @@ type UtilityConfig struct {
 	// `https://github.com/org/repo.git`.
 	CloneURI string `json:"clone_uri,omitempty"`
 	// SkipSubmodules determines if submodules should be
-	// cloned when the job is run. Defaults to true.
+	// cloned when the job is run. Defaults to false.
 	SkipSubmodules bool `json:"skip_submodules,omitempty"`
 	// CloneDepth is the depth of the clone that will be used.
 	// A depth of zero will do a full clone.
 	CloneDepth int `json:"clone_depth,omitempty"`
+	// SkipFetchHead tells prow to avoid a git fetch <remote> call.
+	// The git fetch <remote> <BaseRef> call occurs regardless.
+	SkipFetchHead bool `json:"skip_fetch_head,omitempty"`
 
 	// ExtraRefs are auxiliary repositories that
 	// need to be cloned, determined from config
@@ -437,36 +473,42 @@ type UtilityConfig struct {
 	DecorationConfig *prowapi.DecorationConfig `json:"decoration_config,omitempty"`
 }
 
-// RetestPresubmits returns all presubmits that should be run given a /retest command.
-// This is the set of all presubmits intersected with ((alwaysRun + runContexts) - skipContexts)
-func (c *JobConfig) RetestPresubmits(fullRepoName string, skipContexts, runContexts sets.String) []Presubmit {
-	var result []Presubmit
-	if jobs, ok := c.Presubmits[fullRepoName]; ok {
-		for _, job := range jobs {
-			if skipContexts.Has(job.Context) {
-				continue
-			}
-			if job.AlwaysRun || job.RunIfChanged != "" || runContexts.Has(job.Context) {
-				result = append(result, job)
-			}
-		}
-	}
-	return result
-}
+// Validate ensures all the values set in the UtilityConfig are valid.
+func (u *UtilityConfig) Validate() error {
+	cloneURIValidate := func(cloneURI string) error {
+		// Trim user from uri if exists.
+		cloneURI = cloneURI[strings.Index(cloneURI, "@")+1:]
 
-// GetPresubmit returns the presubmit job for the provided repo and job name.
-func (c *JobConfig) GetPresubmit(repo, jobName string) *Presubmit {
-	presubmits := c.AllPresubmits([]string{repo})
-	for i := range presubmits {
-		ps := presubmits[i]
-		if ps.Name == jobName {
-			return &ps
+		if len(u.CloneURI) != 0 {
+			uri, err := url.Parse(cloneURI)
+			if err != nil {
+				return fmt.Errorf("couldn't parse uri from clone_uri: %v", err)
+			}
+
+			if u.DecorationConfig != nil && u.DecorationConfig.OauthTokenSecret != nil {
+				if uri.Scheme != schemeHTTP && uri.Scheme != schemeHTTPS {
+					return fmt.Errorf("scheme must be http or https when OAuth secret is specified: %s", cloneURI)
+				}
+			}
+		}
+
+		return nil
+	}
+
+	if err := cloneURIValidate(u.CloneURI); err != nil {
+		return err
+	}
+
+	for i, ref := range u.ExtraRefs {
+		if err := cloneURIValidate(ref.CloneURI); err != nil {
+			return fmt.Errorf("extra_ref[%d]: %v", i, err)
 		}
 	}
+
 	return nil
 }
 
-// SetPresubmits updates c.Presubmits to jobs, after compiling and validating their regexes.
+// SetPresubmits updates c.PresubmitStatic to jobs, after compiling and validating their regexes.
 func (c *JobConfig) SetPresubmits(jobs map[string][]Presubmit) error {
 	nj := map[string][]Presubmit{}
 	for k, v := range jobs {
@@ -476,7 +518,7 @@ func (c *JobConfig) SetPresubmits(jobs map[string][]Presubmit) error {
 			return err
 		}
 	}
-	c.Presubmits = nj
+	c.PresubmitsStatic = nj
 	return nil
 }
 
@@ -490,16 +532,19 @@ func (c *JobConfig) SetPostsubmits(jobs map[string][]Postsubmit) error {
 			return err
 		}
 	}
-	c.Postsubmits = nj
+	c.PostsubmitsStatic = nj
 	return nil
 }
 
-// AllPresubmits returns all prow presubmit jobs in repos.
+// AllStaticPresubmits returns all static prow presubmit jobs in repos.
 // if repos is empty, return all presubmits.
-func (c *JobConfig) AllPresubmits(repos []string) []Presubmit {
+// Be aware that this does not return Presubmits that are versioned inside
+// the repo via the `inrepoconfig` feature and hence this list may be
+// incomplete.
+func (c *JobConfig) AllStaticPresubmits(repos []string) []Presubmit {
 	var res []Presubmit
 
-	for repo, v := range c.Presubmits {
+	for repo, v := range c.PresubmitsStatic {
 		if len(repos) == 0 {
 			res = append(res, v...)
 		} else {
@@ -517,10 +562,13 @@ func (c *JobConfig) AllPresubmits(repos []string) []Presubmit {
 
 // AllPostsubmits returns all prow postsubmit jobs in repos.
 // if repos is empty, return all postsubmits.
-func (c *JobConfig) AllPostsubmits(repos []string) []Postsubmit {
+// Be aware that this does not return Postsubmits that are versioned inside
+// the repo via the `inrepoconfig` feature and hence this list may be
+// incomplete.
+func (c *JobConfig) AllStaticPostsubmits(repos []string) []Postsubmit {
 	var res []Postsubmit
 
-	for repo, v := range c.Postsubmits {
+	for repo, v := range c.PostsubmitsStatic {
 		if len(repos) == 0 {
 			res = append(res, v...)
 		} else {
@@ -538,12 +586,9 @@ func (c *JobConfig) AllPostsubmits(repos []string) []Postsubmit {
 
 // AllPeriodics returns all prow periodic jobs.
 func (c *JobConfig) AllPeriodics() []Periodic {
-	var listPeriodic func(ps []Periodic) []Periodic
-	listPeriodic = func(ps []Periodic) []Periodic {
+	listPeriodic := func(ps []Periodic) []Periodic {
 		var res []Periodic
-		for _, p := range ps {
-			res = append(res, p)
-		}
+		res = append(res, ps...)
 		return res
 	}
 

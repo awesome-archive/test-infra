@@ -17,12 +17,16 @@ limitations under the License.
 package config
 
 import (
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
 
 	"k8s.io/apimachinery/pkg/util/diff"
 	"k8s.io/apimachinery/pkg/util/sets"
+	utilpointer "k8s.io/utils/pointer"
+
+	"k8s.io/test-infra/prow/git/v2"
 	"k8s.io/test-infra/prow/github"
 	"k8s.io/test-infra/prow/labels"
 )
@@ -30,30 +34,100 @@ import (
 var testQuery = TideQuery{
 	Orgs:                   []string{"org"},
 	Repos:                  []string{"k/k", "k/t-i"},
+	ExcludedRepos:          []string{"org/repo"},
 	Labels:                 []string{labels.LGTM, labels.Approved},
 	MissingLabels:          []string{"foo"},
+	Author:                 "batman",
 	Milestone:              "milestone",
 	ReviewApprovedRequired: true,
 }
 
+var expectedQueryComponents = []string{
+	"is:pr",
+	"state:open",
+	"archived:false",
+	"label:\"lgtm\"",
+	"label:\"approved\"",
+	"-label:\"foo\"",
+	"author:\"batman\"",
+	"milestone:\"milestone\"",
+	"review:approved",
+}
+
 func TestTideQuery(t *testing.T) {
 	q := " " + testQuery.Query() + " "
-	checkTok := func(tok string) {
-		if !strings.Contains(q, " "+tok+" ") {
-			t.Errorf("Expected query to contain \"%s\", got \"%s\"", tok, q)
-		}
-	}
+	checkTok := checkTok(t, q)
 
-	checkTok("is:pr")
-	checkTok("state:open")
 	checkTok("org:\"org\"")
 	checkTok("repo:\"k/k\"")
 	checkTok("repo:\"k/t-i\"")
-	checkTok("label:\"lgtm\"")
-	checkTok("label:\"approved\"")
-	checkTok("-label:\"foo\"")
-	checkTok("milestone:\"milestone\"")
-	checkTok("review:approved")
+	checkTok("-repo:\"org/repo\"")
+	for _, expectedComponent := range expectedQueryComponents {
+		checkTok(expectedComponent)
+	}
+
+	elements := strings.Fields(q)
+	alreadySeen := sets.String{}
+	for _, element := range elements {
+		if alreadySeen.Has(element) {
+			t.Errorf("element %q was multiple times in the query string", element)
+		}
+		alreadySeen.Insert(element)
+	}
+}
+
+func checkTok(t *testing.T, q string) func(tok string) {
+	return func(tok string) {
+		t.Run("Query string contains "+tok, func(t *testing.T) {
+			if !strings.Contains(q, " "+tok+" ") {
+				t.Errorf("Expected query to contain \"%s\", got \"%s\"", tok, q)
+			}
+		})
+	}
+}
+
+func TestOrgQueries(t *testing.T) {
+	queries := testQuery.OrgQueries()
+	if n := len(queries); n != 2 {
+		t.Errorf("expected exactly two queries, got %d", n)
+	}
+	if queries["org"] == "" {
+		t.Error("no query for org org found")
+	}
+	if queries["k"] == "" {
+		t.Error("no query for org k found")
+	}
+
+	for org, query := range queries {
+		t.Run(org, func(t *testing.T) {
+			checkTok := checkTok(t, " "+query+" ")
+			t.Logf("query: %s", query)
+
+			for _, expectedComponent := range expectedQueryComponents {
+				checkTok(expectedComponent)
+			}
+
+			elements := strings.Fields(query)
+			alreadySeen := sets.String{}
+			for _, element := range elements {
+				if alreadySeen.Has(element) {
+					t.Errorf("element %q was multiple times in the query string", element)
+				}
+				alreadySeen.Insert(element)
+			}
+
+			if org == "org" {
+				checkTok(`org:"org"`)
+				checkTok(`-repo:"org/repo"`)
+			}
+
+			if org == "k" {
+				for _, repo := range testQuery.Repos {
+					checkTok(fmt.Sprintf(`repo:"%s"`, repo))
+				}
+			}
+		})
+	}
 }
 
 func TestOrgExceptionsAndRepos(t *testing.T) {
@@ -103,8 +177,6 @@ func TestMergeMethod(t *testing.T) {
 	ti := &Tide{
 		MergeType: map[string]github.PullRequestMergeType{
 			"kubernetes/kops":             github.MergeRebase,
-			"kubernetes/charts":           github.MergeSquash,
-			"helm/charts":                 github.MergeSquash,
 			"kubernetes-helm":             github.MergeSquash,
 			"kubernetes-helm/chartmuseum": github.MergeMerge,
 		},
@@ -126,11 +198,6 @@ func TestMergeMethod(t *testing.T) {
 			github.MergeRebase,
 		},
 		{
-			"kubernetes",
-			"charts",
-			github.MergeSquash,
-		},
-		{
 			"kubernetes-helm",
 			"monocular",
 			github.MergeSquash,
@@ -143,8 +210,9 @@ func TestMergeMethod(t *testing.T) {
 	}
 
 	for _, test := range testcases {
-		if ti.MergeMethod(test.org, test.repo) != test.expected {
-			t.Errorf("Expected merge method %q but got %q for %s/%s", test.expected, ti.MergeMethod(test.org, test.repo), test.org, test.repo)
+		actual := ti.MergeMethod(OrgRepo{Org: test.org, Repo: test.repo})
+		if actual != test.expected {
+			t.Errorf("Expected merge method %q but got %q for %s/%s", test.expected, actual, test.org, test.repo)
 		}
 	}
 }
@@ -154,14 +222,6 @@ func TestMergeTemplate(t *testing.T) {
 			"kubernetes/kops": {
 				TitleTemplate: "",
 				BodyTemplate:  "",
-			},
-			"kubernetes/charts": {
-				TitleTemplate: "{{ .Number }}",
-				BodyTemplate:  "",
-			},
-			"helm/charts": {
-				TitleTemplate: "",
-				BodyTemplate:  "{{ .Body }}",
 			},
 			"kubernetes-helm": {
 				TitleTemplate: "{{ .Title }}",
@@ -189,22 +249,6 @@ func TestMergeTemplate(t *testing.T) {
 			},
 		},
 		{
-			org:  "kubernetes",
-			repo: "charts",
-			expected: TideMergeCommitTemplate{
-				TitleTemplate: "{{ .Number }}",
-				BodyTemplate:  "",
-			},
-		},
-		{
-			org:  "helm",
-			repo: "charts",
-			expected: TideMergeCommitTemplate{
-				TitleTemplate: "",
-				BodyTemplate:  "{{ .Body }}",
-			},
-		},
-		{
 			org:  "kubernetes-helm",
 			repo: "monocular",
 			expected: TideMergeCommitTemplate{
@@ -215,7 +259,7 @@ func TestMergeTemplate(t *testing.T) {
 	}
 
 	for _, test := range testcases {
-		actual := ti.MergeCommitTemplate(test.org, test.repo)
+		actual := ti.MergeCommitTemplate(OrgRepo{Org: test.org, Repo: test.repo})
 
 		if actual.TitleTemplate != test.expected.TitleTemplate || actual.BodyTemplate != test.expected.BodyTemplate {
 			t.Errorf("Expected title \"%v\", body \"%v\", but got title \"%v\", body \"%v\" for %v/%v", test.expected.TitleTemplate, test.expected.BodyTemplate, actual.TitleTemplate, actual.BodyTemplate, test.org, test.repo)
@@ -382,7 +426,7 @@ func TestConfigGetTideContextPolicy(t *testing.T) {
 					},
 				},
 				JobConfig: JobConfig{
-					Presubmits: map[string][]Presubmit{
+					PresubmitsStatic: map[string][]Presubmit{
 						"org/repo": {
 							Presubmit{
 								Reporter: Reporter{
@@ -497,20 +541,105 @@ func TestConfigGetTideContextPolicy(t *testing.T) {
 				SkipUnknownContexts:       &yes,
 			},
 		},
+		{
+			name: "jobs from inrepoconfig are considered",
+			config: Config{
+				JobConfig: JobConfig{
+					ProwYAMLGetter: fakeProwYAMLGetterFactory(
+						[]Presubmit{
+							{
+								AlwaysRun: true,
+								Reporter:  Reporter{Context: "ir0"},
+							},
+							{
+								AlwaysRun: true,
+								Optional:  true,
+								Reporter:  Reporter{Context: "ir1"},
+							},
+						},
+						nil,
+					),
+				},
+				ProwConfig: ProwConfig{
+					InRepoConfig: InRepoConfig{
+						Enabled: map[string]*bool{"*": utilpointer.BoolPtr(true)},
+					},
+				},
+			},
+			expected: TideContextPolicy{
+				RequiredContexts:          []string{"ir0"},
+				RequiredIfPresentContexts: []string{},
+				OptionalContexts:          []string{"ir1"},
+			},
+		},
+		{
+			name: "both static and inrepoconfig jobs are consired",
+			config: Config{
+				JobConfig: JobConfig{
+					PresubmitsStatic: map[string][]Presubmit{
+						"org/repo": {
+							Presubmit{
+								Reporter: Reporter{
+									Context: "pr1",
+								},
+								AlwaysRun: true,
+							},
+							Presubmit{
+								Reporter: Reporter{
+									Context: "po1",
+								},
+								AlwaysRun: true,
+								Optional:  true,
+							},
+						},
+					},
+					ProwYAMLGetter: fakeProwYAMLGetterFactory(
+						[]Presubmit{
+							{
+								AlwaysRun: true,
+								Reporter:  Reporter{Context: "ir0"},
+							},
+							{
+								AlwaysRun: true,
+								Optional:  true,
+								Reporter:  Reporter{Context: "ir1"},
+							},
+						},
+						nil,
+					),
+				},
+				ProwConfig: ProwConfig{
+					InRepoConfig: InRepoConfig{
+						Enabled: map[string]*bool{"*": utilpointer.BoolPtr(true)},
+					},
+				},
+			},
+			expected: TideContextPolicy{
+				RequiredContexts:          []string{"ir0", "pr1"},
+				RequiredIfPresentContexts: []string{},
+				OptionalContexts:          []string{"ir1", "po1"},
+			},
+		},
 	}
 
 	for _, tc := range testCases {
-		p, err := tc.config.GetTideContextPolicy(org, repo, branch)
-		if !reflect.DeepEqual(p, &tc.expected) {
-			t.Errorf("%s - did not get expected policy: %s", tc.name, diff.ObjectReflectDiff(&tc.expected, p))
-		}
-		if err != nil {
-			if err.Error() != tc.error {
-				t.Errorf("%s - expected error %v got %v", tc.name, tc.error, err.Error())
+		t.Run(tc.name, func(t *testing.T) {
+
+			baseSHAGetter := func() (string, error) {
+				return "baseSHA", nil
 			}
-		} else if tc.error != "" {
-			t.Errorf("%s - expected error %v got nil", tc.name, tc.error)
-		}
+			p, err := tc.config.GetTideContextPolicy(nil, org, repo, branch, baseSHAGetter, "some-sha")
+			if !reflect.DeepEqual(p, &tc.expected) {
+				t.Errorf("%s - did not get expected policy: %s", tc.name, diff.ObjectReflectDiff(&tc.expected, p))
+			}
+			if err != nil {
+				if err.Error() != tc.error {
+					t.Errorf("%s - expected error %v got %v", tc.name, tc.error, err.Error())
+				}
+			} else if tc.error != "" {
+				t.Errorf("%s - expected error %v got nil", tc.name, tc.error)
+			}
+		})
 	}
 }
 
@@ -949,5 +1078,14 @@ func TestTideContextPolicy_MissingRequiredContexts(t *testing.T) {
 		if !sets.NewString(missingContexts...).Equal(sets.NewString(tc.expectedContexts...)) {
 			t.Errorf("%s - expected %v got %v", tc.name, tc.expectedContexts, missingContexts)
 		}
+	}
+}
+
+func fakeProwYAMLGetterFactory(presubmits []Presubmit, postsubmits []Postsubmit) ProwYAMLGetter {
+	return func(_ *Config, _ git.ClientFactory, _, _ string, _ ...string) (*ProwYAML, error) {
+		return &ProwYAML{
+			Presubmits:  presubmits,
+			Postsubmits: postsubmits,
+		}, nil
 	}
 }

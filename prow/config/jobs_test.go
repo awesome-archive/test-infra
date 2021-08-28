@@ -22,12 +22,14 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"strings"
 	"testing"
 
-	buildapi "github.com/knative/build/pkg/apis/build/v1alpha1"
-	"k8s.io/apimachinery/pkg/util/sets"
-
+	"github.com/google/go-cmp/cmp"
 	coreapi "k8s.io/api/core/v1"
+	"sigs.k8s.io/yaml"
+
+	prowapi "k8s.io/test-infra/prow/apis/prowjobs/v1"
 )
 
 var c *Config
@@ -59,26 +61,77 @@ func checkOverlapBrancher(b1, b2 Brancher) bool {
 func TestMain(m *testing.M) {
 	flag.Parse()
 	if *configPath == "" {
-		fmt.Println("--config must set")
-		os.Exit(1)
+		panic("--config must set")
 	}
 
-	conf, err := Load(*configPath, *jobConfigPath)
+	conf, err := Load(*configPath, *jobConfigPath, nil, "")
 	if err != nil {
-		fmt.Printf("Could not load config: %v", err)
-		os.Exit(1)
+		panic(fmt.Sprintf("Could not load config: %v", err))
 	}
 	c = conf
 
 	os.Exit(m.Run())
 }
 
+func TestReporterConfigRoundtrip(t *testing.T) {
+	tests := []struct {
+		content    string
+		expectedPJ JobBase
+	}{
+		{
+			content: `name: abc
+reporter_config:
+  slack:
+    job_states_to_report: []`,
+			expectedPJ: JobBase{
+				Name: "abc",
+				ReporterConfig: &prowapi.ReporterConfig{
+					Slack: &prowapi.SlackReporterConfig{
+						JobStatesToReport: []prowapi.ProwJobState{},
+					},
+				},
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run("a", func(t *testing.T) {
+			// Unmarshal straight should pass
+			var pj JobBase
+			if err := yaml.Unmarshal([]byte(tc.content), &pj); err != nil {
+				t.Fatal(err)
+			}
+			if diff := cmp.Diff(tc.expectedPJ, pj); diff != "" {
+				t.Fatal("Failed unmarshal straight:\n\n", diff)
+			}
+
+			// Marshal (roundtrip)
+			marshalFromUnmarshal, err := yaml.Marshal(pj)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if diff := cmp.Diff(tc.content, strings.TrimSpace(string(marshalFromUnmarshal))); diff != "" {
+				t.Fatal("Failed marshal back to original: \n\n", diff)
+			}
+
+			// Unmarshal again (roundtrip)
+			var secondPj JobBase
+			if err := yaml.Unmarshal([]byte(marshalFromUnmarshal), &secondPj); err != nil {
+				t.Fatal(err)
+			}
+			if diff := cmp.Diff(tc.expectedPJ, secondPj); diff != "" {
+				t.Fatal("Failed restore:\n\n", diff)
+			}
+		})
+	}
+}
+
 func TestPresubmits(t *testing.T) {
-	if len(c.Presubmits) == 0 {
+	if len(c.PresubmitsStatic) == 0 {
 		t.Fatalf("No jobs found in presubmit.yaml.")
 	}
 
-	for _, rootJobs := range c.Presubmits {
+	for _, rootJobs := range c.PresubmitsStatic {
 		for i, job := range rootJobs {
 			if job.Name == "" {
 				t.Errorf("Job %v needs a name.", job)
@@ -121,11 +174,11 @@ func TestPresubmits(t *testing.T) {
 
 // TODO(krzyzacy): technically this, and TestPresubmits above should belong to config/ instead of prow/
 func TestPostsubmits(t *testing.T) {
-	if len(c.Postsubmits) == 0 {
+	if len(c.PostsubmitsStatic) == 0 {
 		t.Fatalf("No jobs found in presubmit.yaml.")
 	}
 
-	for _, rootJobs := range c.Postsubmits {
+	for _, rootJobs := range c.PostsubmitsStatic {
 		for i, job := range rootJobs {
 			if job.Name == "" {
 				t.Errorf("Job %v needs a name.", job)
@@ -159,107 +212,8 @@ func TestPostsubmits(t *testing.T) {
 	}
 }
 
-func TestRetestPresubmits(t *testing.T) {
-	var testcases = []struct {
-		skipContexts     sets.String
-		runContexts      sets.String
-		expectedContexts []string
-	}{
-		{
-			skipContexts:     sets.NewString(),
-			runContexts:      sets.NewString(),
-			expectedContexts: []string{"gce", "unit"},
-		},
-		{
-			skipContexts:     sets.NewString("gce"),
-			runContexts:      sets.NewString(),
-			expectedContexts: []string{"unit"},
-		},
-		{
-			skipContexts:     sets.NewString(),
-			runContexts:      sets.NewString("federation", "nonexistent"),
-			expectedContexts: []string{"gce", "unit", "federation"},
-		},
-		{
-			skipContexts:     sets.NewString(),
-			runContexts:      sets.NewString("gke"),
-			expectedContexts: []string{"gce", "unit", "gke"},
-		},
-		{
-			skipContexts:     sets.NewString("gce"),
-			runContexts:      sets.NewString("gce"), // should never happ)n
-			expectedContexts: []string{"unit"},
-		},
-	}
-	c := &Config{
-		JobConfig: JobConfig{
-			Presubmits: map[string][]Presubmit{
-				"org/repo": {
-					{
-						Reporter: Reporter{
-							Context: "gce",
-						},
-						AlwaysRun: true,
-					},
-					{
-						Reporter: Reporter{
-							Context: "unit",
-						},
-						AlwaysRun: true,
-					},
-					{
-						Reporter: Reporter{
-							Context: "gke",
-						},
-						AlwaysRun: false,
-					},
-					{
-						Reporter: Reporter{
-							Context: "federation",
-						},
-						AlwaysRun: false,
-					},
-				},
-				"org/repo2": {
-					{
-						Reporter: Reporter{
-							Context: "shouldneverrun",
-						},
-						AlwaysRun: true,
-					},
-				},
-			},
-		},
-	}
-	for _, tc := range testcases {
-		actualContexts := c.RetestPresubmits("org/repo", tc.skipContexts, tc.runContexts)
-		match := true
-		if len(actualContexts) != len(tc.expectedContexts) {
-			match = false
-		} else {
-			for _, actualJob := range actualContexts {
-				found := false
-				for _, expectedContext := range tc.expectedContexts {
-					if expectedContext == actualJob.Context {
-						found = true
-						break
-					}
-				}
-				if !found {
-					match = false
-					break
-				}
-			}
-		}
-		if !match {
-			t.Errorf("Wrong contexts for skip %v run %v. Got %v, expected %v.", tc.runContexts, tc.skipContexts, actualContexts, tc.expectedContexts)
-		}
-	}
-
-}
-
-func TestConditionalPresubmits(t *testing.T) {
-	presubmits := []Presubmit{
+func TestRunIfChangedPresubmits(t *testing.T) {
+	PresubmitsStatic := []Presubmit{
 		{
 			JobBase: JobBase{
 				Name: "cross build",
@@ -269,8 +223,8 @@ func TestConditionalPresubmits(t *testing.T) {
 			},
 		},
 	}
-	SetPresubmitRegexes(presubmits)
-	ps := presubmits[0]
+	SetPresubmitRegexes(PresubmitsStatic)
+	ps := PresubmitsStatic[0]
 	var testcases = []struct {
 		changes  []string
 		expected bool
@@ -290,10 +244,122 @@ func TestConditionalPresubmits(t *testing.T) {
 	}
 }
 
+// TestRunIfChangedPostsubmits is identical to TestRunIfChangedPresubmits.
+func TestRunIfChangedPostsubmits(t *testing.T) {
+	PostsubmitsStatic := []Postsubmit{
+		{
+			JobBase: JobBase{
+				Name: "cross build",
+			},
+			RegexpChangeMatcher: RegexpChangeMatcher{
+				RunIfChanged: `(Makefile|\.sh|_(windows|linux|osx|unknown)(_test)?\.go)$`,
+			},
+		},
+	}
+	SetPostsubmitRegexes(PostsubmitsStatic)
+	ps := PostsubmitsStatic[0]
+	var testcases = []struct {
+		changes  []string
+		expected bool
+	}{
+		{[]string{"some random file"}, false},
+		{[]string{"./pkg/util/rlimit/rlimit_linux.go"}, true},
+		{[]string{"./pkg/util/rlimit/rlimit_unknown_test.go"}, true},
+		{[]string{"build.sh"}, true},
+		{[]string{"build.shoo"}, false},
+		{[]string{"Makefile"}, true},
+	}
+	for _, tc := range testcases {
+		actual := ps.RunsAgainstChanges(tc.changes)
+		if actual != tc.expected {
+			t.Errorf("wrong RunsAgainstChanges(%#v) result. Got %v, expected %v", tc.changes, actual, tc.expected)
+		}
+	}
+}
+
+func TestSkipIfOnlyChangedPresubmits(t *testing.T) {
+	PresubmitsStatic := []Presubmit{
+		{
+			JobBase: JobBase{
+				Name: "cross build",
+			},
+			RegexpChangeMatcher: RegexpChangeMatcher{
+				// Files satisfying any of:
+				// - in the top-level docs/ directory
+				// - with .md/.adoc extensions
+				// - with basename README or OWNERS
+				SkipIfOnlyChanged: `^docs/|\.(md|adoc)$|/?(README|OWNERS)$`,
+			},
+		},
+	}
+	SetPresubmitRegexes(PresubmitsStatic)
+	ps := PresubmitsStatic[0]
+	var testcases = []struct {
+		changes  []string
+		expected bool
+	}{
+		{[]string{"some random file"}, true},
+		{[]string{"./pkg/util/rlimit/rlimit_linux.go"}, true},
+		// Skips because in docs/, even though it's a go file. Caveat emptor.
+		{[]string{"docs/cobragen.go"}, false},
+		// Our regex isn't expecting paths to start with ./
+		{[]string{"./docs/cobragen.go"}, true},
+		{[]string{"README", "README.md", "OWNERS", "path/to/something.adoc", "path/to/README"}, false},
+		// Any non-matching file triggers the job
+		{[]string{"README", "README.md", "OWNERS", "path/to/something.adoc", "path/to/README", "foo"}, true},
+	}
+	for _, tc := range testcases {
+		actual := ps.RunsAgainstChanges(tc.changes)
+		if actual != tc.expected {
+			t.Errorf("wrong RunsAgainstChanges(%#v) result. Got %v, expected %v", tc.changes, actual, tc.expected)
+		}
+	}
+}
+
+// TestSkipIfOnlyChangedPostsubmits is identical to TestSkipIfOnlyChangedPresubmits.
+func TestSkipIfOnlyChangedPostsubmits(t *testing.T) {
+	PostsubmitsStatic := []Postsubmit{
+		{
+			JobBase: JobBase{
+				Name: "cross build",
+			},
+			RegexpChangeMatcher: RegexpChangeMatcher{
+				// Files satisfying any of:
+				// - in the top-level docs/ directory
+				// - with .md/.adoc extensions
+				// - with basename README or OWNERS
+				SkipIfOnlyChanged: `^docs/|\.(md|adoc)$|/?(README|OWNERS)$`,
+			},
+		},
+	}
+	SetPostsubmitRegexes(PostsubmitsStatic)
+	ps := PostsubmitsStatic[0]
+	var testcases = []struct {
+		changes  []string
+		expected bool
+	}{
+		{[]string{"some random file"}, true},
+		{[]string{"./pkg/util/rlimit/rlimit_linux.go"}, true},
+		// Skips because in docs/, even though it's a go file. Caveat emptor.
+		{[]string{"docs/cobragen.go"}, false},
+		// Our regex isn't expecting paths to start with ./
+		{[]string{"./docs/cobragen.go"}, true},
+		{[]string{"README", "README.md", "OWNERS", "path/to/something.adoc", "path/to/README"}, false},
+		// Any non-matching file triggers the job
+		{[]string{"README", "README.md", "OWNERS", "path/to/something.adoc", "path/to/README", "foo"}, true},
+	}
+	for _, tc := range testcases {
+		actual := ps.RunsAgainstChanges(tc.changes)
+		if actual != tc.expected {
+			t.Errorf("wrong RunsAgainstChanges(%#v) result. Got %v, expected %v", tc.changes, actual, tc.expected)
+		}
+	}
+}
+
 func TestListPresubmit(t *testing.T) {
 	c := &Config{
 		JobConfig: JobConfig{
-			Presubmits: map[string][]Presubmit{
+			PresubmitsStatic: map[string][]Presubmit{
 				"r1": {
 					{
 						JobBase: JobBase{
@@ -311,7 +377,7 @@ func TestListPresubmit(t *testing.T) {
 					{JobBase: JobBase{Name: "d"}},
 				},
 			},
-			Postsubmits: map[string][]Postsubmit{
+			PostsubmitsStatic: map[string][]Postsubmit{
 				"r1": {{JobBase: JobBase{Name: "e"}}},
 			},
 			Periodics: []Periodic{
@@ -338,7 +404,7 @@ func TestListPresubmit(t *testing.T) {
 	}
 
 	for _, tc := range testcases {
-		actual := c.AllPresubmits(tc.repos)
+		actual := c.AllStaticPresubmits(tc.repos)
 		if len(actual) != len(tc.expected) {
 			t.Fatalf("test %s - Wrong number of jobs. Got %v, expected %v", tc.name, actual, tc.expected)
 		}
@@ -360,10 +426,10 @@ func TestListPresubmit(t *testing.T) {
 func TestListPostsubmit(t *testing.T) {
 	c := &Config{
 		JobConfig: JobConfig{
-			Presubmits: map[string][]Presubmit{
+			PresubmitsStatic: map[string][]Presubmit{
 				"r1": {{JobBase: JobBase{Name: "a"}}},
 			},
-			Postsubmits: map[string][]Postsubmit{
+			PostsubmitsStatic: map[string][]Postsubmit{
 				"r1": {
 					{
 						JobBase: JobBase{
@@ -398,7 +464,7 @@ func TestListPostsubmit(t *testing.T) {
 	}
 
 	for _, tc := range testcases {
-		actual := c.AllPostsubmits(tc.repos)
+		actual := c.AllStaticPostsubmits(tc.repos)
 		if len(actual) != len(tc.expected) {
 			t.Fatalf("%s - Wrong number of jobs. Got %v, expected %v", tc.name, actual, tc.expected)
 		}
@@ -420,10 +486,10 @@ func TestListPostsubmit(t *testing.T) {
 func TestListPeriodic(t *testing.T) {
 	c := &Config{
 		JobConfig: JobConfig{
-			Presubmits: map[string][]Presubmit{
+			PresubmitsStatic: map[string][]Presubmit{
 				"r1": {{JobBase: JobBase{Name: "a"}}},
 			},
-			Postsubmits: map[string][]Postsubmit{
+			PostsubmitsStatic: map[string][]Postsubmit{
 				"r1": {{JobBase: JobBase{Name: "b"}}},
 			},
 			Periodics: []Periodic{
@@ -515,12 +581,12 @@ func TestRunAgainstBranch(t *testing.T) {
 }
 
 func TestValidPodNames(t *testing.T) {
-	for _, j := range c.AllPresubmits([]string{}) {
+	for _, j := range c.AllStaticPresubmits([]string{}) {
 		if !podRe.MatchString(j.Name) {
 			t.Errorf("Job \"%s\" must match regex \"%s\".", j.Name, podRe.String())
 		}
 	}
-	for _, j := range c.AllPostsubmits([]string{}) {
+	for _, j := range c.AllStaticPostsubmits([]string{}) {
 		if !podRe.MatchString(j.Name) {
 			t.Errorf("Job \"%s\" must match regex \"%s\".", j.Name, podRe.String())
 		}
@@ -536,7 +602,7 @@ func TestNoDuplicateJobs(t *testing.T) {
 	// Presubmit test is covered under TestPresubmits() above
 
 	allJobs := make(map[string]bool)
-	for _, j := range c.AllPostsubmits([]string{}) {
+	for _, j := range c.AllStaticPostsubmits([]string{}) {
 		if allJobs[j.Name] {
 			t.Errorf("Found duplicate job in postsubmit: %s.", j.Name)
 		}
@@ -557,7 +623,6 @@ func TestMergePreset(t *testing.T) {
 		name      string
 		jobLabels map[string]string
 		pod       *coreapi.PodSpec
-		buildSpec *buildapi.BuildSpec
 		presets   []Preset
 
 		shouldError  bool
@@ -569,7 +634,6 @@ func TestMergePreset(t *testing.T) {
 			name:      "one volume",
 			jobLabels: map[string]string{"foo": "bar"},
 			pod:       &coreapi.PodSpec{},
-			buildSpec: &buildapi.BuildSpec{},
 			presets: []Preset{
 				{
 					Labels:  map[string]string{"foo": "bar"},
@@ -582,7 +646,6 @@ func TestMergePreset(t *testing.T) {
 			name:      "wrong label",
 			jobLabels: map[string]string{"foo": "nope"},
 			pod:       &coreapi.PodSpec{},
-			buildSpec: &buildapi.BuildSpec{},
 			presets: []Preset{
 				{
 					Labels:  map[string]string{"foo": "bar"},
@@ -603,22 +666,9 @@ func TestMergePreset(t *testing.T) {
 			shouldError: true,
 		},
 		{
-			name:      "conflicting volume name for buildspec",
-			jobLabels: map[string]string{"foo": "bar"},
-			buildSpec: &buildapi.BuildSpec{Volumes: []coreapi.Volume{{Name: "baz"}}},
-			presets: []Preset{
-				{
-					Labels:  map[string]string{"foo": "bar"},
-					Volumes: []coreapi.Volume{{Name: "baz"}},
-				},
-			},
-			shouldError: true,
-		},
-		{
 			name:      "non conflicting volume name",
 			jobLabels: map[string]string{"foo": "bar"},
 			pod:       &coreapi.PodSpec{Volumes: []coreapi.Volume{{Name: "baz"}}},
-			buildSpec: &buildapi.BuildSpec{Volumes: []coreapi.Volume{{Name: "baz"}}},
 			presets: []Preset{
 				{
 					Labels:  map[string]string{"foo": "bar"},
@@ -631,7 +681,6 @@ func TestMergePreset(t *testing.T) {
 			name:      "one env",
 			jobLabels: map[string]string{"foo": "bar"},
 			pod:       &coreapi.PodSpec{Containers: []coreapi.Container{{}}},
-			buildSpec: &buildapi.BuildSpec{},
 			presets: []Preset{
 				{
 					Labels: map[string]string{"foo": "bar"},
@@ -644,7 +693,6 @@ func TestMergePreset(t *testing.T) {
 			name:      "conflicting env",
 			jobLabels: map[string]string{"foo": "bar"},
 			pod:       &coreapi.PodSpec{Containers: []coreapi.Container{{Env: []coreapi.EnvVar{{Name: "baz"}}}}},
-			buildSpec: &buildapi.BuildSpec{Template: &buildapi.TemplateInstantiationSpec{Env: []coreapi.EnvVar{{Name: "baz"}}}},
 			presets: []Preset{
 				{
 					Labels: map[string]string{"foo": "bar"},
@@ -657,7 +705,6 @@ func TestMergePreset(t *testing.T) {
 			name:      "one vm",
 			jobLabels: map[string]string{"foo": "bar"},
 			pod:       &coreapi.PodSpec{Containers: []coreapi.Container{{}}},
-			buildSpec: &buildapi.BuildSpec{},
 			presets: []Preset{
 				{
 					Labels:       map[string]string{"foo": "bar"},
@@ -670,7 +717,6 @@ func TestMergePreset(t *testing.T) {
 			name:      "one of each",
 			jobLabels: map[string]string{"foo": "bar"},
 			pod:       &coreapi.PodSpec{Containers: []coreapi.Container{{}}},
-			buildSpec: &buildapi.BuildSpec{},
 			presets: []Preset{
 				{
 					Labels:       map[string]string{"foo": "bar"},
@@ -687,7 +733,6 @@ func TestMergePreset(t *testing.T) {
 			name:      "two vm",
 			jobLabels: map[string]string{"foo": "bar"},
 			pod:       &coreapi.PodSpec{Containers: []coreapi.Container{{}}},
-			buildSpec: &buildapi.BuildSpec{},
 			presets: []Preset{
 				{
 					Labels:       map[string]string{"foo": "bar"},
@@ -700,7 +745,6 @@ func TestMergePreset(t *testing.T) {
 			name:      "default preset only",
 			jobLabels: map[string]string{"foo": "bar"},
 			pod:       &coreapi.PodSpec{Containers: []coreapi.Container{{}}},
-			buildSpec: &buildapi.BuildSpec{},
 			presets: []Preset{
 				{
 					Env: []coreapi.EnvVar{{Name: "baz"}},
@@ -712,7 +756,6 @@ func TestMergePreset(t *testing.T) {
 			name:      "default and matching presets",
 			jobLabels: map[string]string{"foo": "bar"},
 			pod:       &coreapi.PodSpec{Containers: []coreapi.Container{{}}},
-			buildSpec: &buildapi.BuildSpec{},
 			presets: []Preset{
 				{
 					Env: []coreapi.EnvVar{{Name: "baz"}},
@@ -729,7 +772,6 @@ func TestMergePreset(t *testing.T) {
 			name:      "default and non-matching presets",
 			jobLabels: map[string]string{"foo": "bar"},
 			pod:       &coreapi.PodSpec{Containers: []coreapi.Container{{}}},
-			buildSpec: &buildapi.BuildSpec{},
 			presets: []Preset{
 				{
 					Env: []coreapi.EnvVar{{Name: "baz"}},
@@ -745,7 +787,6 @@ func TestMergePreset(t *testing.T) {
 			name:      "multiple default presets",
 			jobLabels: map[string]string{"foo": "bar"},
 			pod:       &coreapi.PodSpec{Containers: []coreapi.Container{{}}},
-			buildSpec: &buildapi.BuildSpec{},
 			presets: []Preset{
 				{
 					Env: []coreapi.EnvVar{{Name: "baz"}},
@@ -774,7 +815,7 @@ func TestMergePreset(t *testing.T) {
 	}
 	for _, tc := range tcs {
 		t.Run(tc.name, func(t *testing.T) {
-			if err := resolvePresets("foo", tc.jobLabels, tc.pod, tc.buildSpec, tc.presets); err == nil && tc.shouldError {
+			if err := resolvePresets("foo", tc.jobLabels, tc.pod, tc.presets); err == nil && tc.shouldError {
 				t.Errorf("expected error but got none.")
 			} else if err != nil && !tc.shouldError {
 				t.Errorf("expected no error but got %v.", err)
@@ -785,23 +826,12 @@ func TestMergePreset(t *testing.T) {
 			if len(tc.pod.Volumes) != tc.numVol {
 				t.Errorf("wrong number of volumes for podspec. Got %d, expected %d.", len(tc.pod.Volumes), tc.numVol)
 			}
-			if len(tc.buildSpec.Volumes) != tc.numVol {
-				t.Errorf("wrong number of volumes for buildspec. Got %d, expected %d.", len(tc.pod.Volumes), tc.numVol)
-			}
 			for _, c := range tc.pod.Containers {
 				if len(c.VolumeMounts) != tc.numVolMounts {
 					t.Errorf("wrong number of volume mounts for podspec. Got %d, expected %d.", len(c.VolumeMounts), tc.numVolMounts)
 				}
 				if len(c.Env) != tc.numEnv {
 					t.Errorf("wrong number of env vars for podspec. Got %d, expected %d.", len(c.Env), tc.numEnv)
-				}
-			}
-			for _, c := range tc.buildSpec.Steps {
-				if len(c.VolumeMounts) != tc.numVolMounts {
-					t.Errorf("wrong number of volume mounts for buildspec. Got %d, expected %d.", len(c.VolumeMounts), tc.numVolMounts)
-				}
-				if len(c.Env) != tc.numEnv {
-					t.Errorf("wrong number of env vars  for buildspec. Got %d, expected %d.", len(c.Env), tc.numEnv)
 				}
 			}
 		})
@@ -815,6 +845,9 @@ func TestPresubmitShouldRun(t *testing.T) {
 		fileError   error
 		job         Presubmit
 		ref         string
+		forced      bool
+		defaults    bool
+
 		expectedRun bool
 		expectedErr bool
 	}{
@@ -869,13 +902,14 @@ func TestPresubmitShouldRun(t *testing.T) {
 			expectedRun: true,
 		},
 		{
-			name: "job with always_run: false and no run_if_changed should not run",
+			name: "job with always_run: false and no run_if_changed or skip_if_only_changed should not run",
 			job: Presubmit{
 				AlwaysRun:    false,
 				Trigger:      `(?m)^/test (?:.*? )?foo(?: .*?)?$`,
 				RerunCommand: "/test foo",
 				RegexpChangeMatcher: RegexpChangeMatcher{
-					RunIfChanged: "",
+					RunIfChanged:      "",
+					SkipIfOnlyChanged: "",
 				},
 			},
 			ref:         "master",
@@ -896,6 +930,21 @@ func TestPresubmitShouldRun(t *testing.T) {
 			expectedErr: true,
 		},
 		{
+			name: "job with skip_if_only_changed but file get errors should not run",
+			job: Presubmit{
+				Trigger:      `(?m)^/test (?:.*? )?foo(?: .*?)?$`,
+				RerunCommand: "/test foo",
+				RegexpChangeMatcher: RegexpChangeMatcher{
+					SkipIfOnlyChanged: "file",
+				},
+			},
+			ref:         "master",
+			fileChanges: []string{"something"},
+			fileError:   errors.New("oops"),
+			expectedRun: false,
+			expectedErr: true,
+		},
+		{
 			name: "job with run_if_changed not matching should not run",
 			job: Presubmit{
 				Trigger:      `(?m)^/test (?:.*? )?foo(?: .*?)?$`,
@@ -907,6 +956,47 @@ func TestPresubmitShouldRun(t *testing.T) {
 			ref:         "master",
 			fileChanges: []string{"something"},
 			expectedRun: false,
+		},
+		{
+			name: "job with skip_if_only_changed all matching should not run",
+			job: Presubmit{
+				Trigger:      `(?m)^/test (?:.*? )?foo(?: .*?)?$`,
+				RerunCommand: "/test foo",
+				RegexpChangeMatcher: RegexpChangeMatcher{
+					SkipIfOnlyChanged: "file$",
+				},
+			},
+			ref:         "master",
+			fileChanges: []string{"onefile", "two-file", "pkg/controller/three_file"},
+			expectedRun: false,
+		},
+		{
+			name: "job with run_if_changed not matching should run when default=true",
+			job: Presubmit{
+				Trigger:      `(?m)^/test (?:.*? )?foo(?: .*?)?$`,
+				RerunCommand: "/test foo",
+				RegexpChangeMatcher: RegexpChangeMatcher{
+					RunIfChanged: "^file$",
+				},
+			},
+			ref:         "master",
+			fileChanges: []string{"something"},
+			defaults:    true,
+			expectedRun: true,
+		},
+		{
+			name: "job with skip_if_only_changed all matching should run when default=true",
+			job: Presubmit{
+				Trigger:      `(?m)^/test (?:.*? )?foo(?: .*?)?$`,
+				RerunCommand: "/test foo",
+				RegexpChangeMatcher: RegexpChangeMatcher{
+					SkipIfOnlyChanged: "file$",
+				},
+			},
+			ref:         "master",
+			fileChanges: []string{"onefile", "two-file", "pkg/controller/three_file"},
+			defaults:    true,
+			expectedRun: true,
 		},
 		{
 			name: "job with run_if_changed matching should run",
@@ -921,6 +1011,19 @@ func TestPresubmitShouldRun(t *testing.T) {
 			fileChanges: []string{"file"},
 			expectedRun: true,
 		},
+		{
+			name: "job with skip_if_all_changed partially matching should run",
+			job: Presubmit{
+				Trigger:      `(?m)^/test (?:.*? )?foo(?: .*?)?$`,
+				RerunCommand: "/test foo",
+				RegexpChangeMatcher: RegexpChangeMatcher{
+					SkipIfOnlyChanged: "file$",
+				},
+			},
+			ref:         "master",
+			fileChanges: []string{"onefile", "two-file", "pkg/controller/three_file.go"},
+			expectedRun: true,
+		},
 	}
 
 	for _, testCase := range testCases {
@@ -931,7 +1034,7 @@ func TestPresubmitShouldRun(t *testing.T) {
 			}
 			jobShouldRun, err := jobs[0].ShouldRun(testCase.ref, func() ([]string, error) {
 				return testCase.fileChanges, testCase.fileError
-			}, false, false)
+			}, testCase.forced, testCase.defaults)
 			if err == nil && testCase.expectedErr {
 				t.Errorf("%s: expected an error and got none", testCase.name)
 			}
@@ -946,6 +1049,8 @@ func TestPresubmitShouldRun(t *testing.T) {
 }
 
 func TestPostsubmitShouldRun(t *testing.T) {
+	true_ := true
+	false_ := false
 	var testCases = []struct {
 		name        string
 		fileChanges []string
@@ -1014,6 +1119,19 @@ func TestPostsubmitShouldRun(t *testing.T) {
 			expectedErr: true,
 		},
 		{
+			name: "job with skip_if_only_changed but file get errors should not run",
+			job: Postsubmit{
+				RegexpChangeMatcher: RegexpChangeMatcher{
+					SkipIfOnlyChanged: "file",
+				},
+			},
+			ref:         "master",
+			fileChanges: []string{"something"},
+			fileError:   errors.New("oops"),
+			expectedRun: false,
+			expectedErr: true,
+		},
+		{
 			name: "job with run_if_changed not matching should not run",
 			job: Postsubmit{
 				RegexpChangeMatcher: RegexpChangeMatcher{
@@ -1022,6 +1140,17 @@ func TestPostsubmitShouldRun(t *testing.T) {
 			},
 			ref:         "master",
 			fileChanges: []string{"something"},
+			expectedRun: false,
+		},
+		{
+			name: "job with skip_if_only_changed all matching should not run",
+			job: Postsubmit{
+				RegexpChangeMatcher: RegexpChangeMatcher{
+					SkipIfOnlyChanged: "file$",
+				},
+			},
+			ref:         "master",
+			fileChanges: []string{"onefile", "two-file", "pkg/controller/three_file"},
 			expectedRun: false,
 		},
 		{
@@ -1034,6 +1163,79 @@ func TestPostsubmitShouldRun(t *testing.T) {
 			ref:         "master",
 			fileChanges: []string{"file"},
 			expectedRun: true,
+		},
+		{
+			name: "job with skip_if_only_changed partially matching should run",
+			job: Postsubmit{
+				RegexpChangeMatcher: RegexpChangeMatcher{
+					SkipIfOnlyChanged: "file$",
+				},
+			},
+			ref:         "master",
+			fileChanges: []string{"onefile", "two-file", "pkg/controller/three_file.go"},
+			expectedRun: true,
+		},
+		{
+			name: "job with run_if_changed matching (and `always_run` explicitly set to false) should run",
+			job: Postsubmit{
+				AlwaysRun: &false_,
+				RegexpChangeMatcher: RegexpChangeMatcher{
+					RunIfChanged: "^file$",
+				},
+			},
+			ref:         "master",
+			fileChanges: []string{"file"},
+			expectedRun: true,
+		},
+		{
+			name: "job with skip_if_only_changed partially matching (and `always_run` explicitly set to false) should run",
+			job: Postsubmit{
+				AlwaysRun: &false_,
+				RegexpChangeMatcher: RegexpChangeMatcher{
+					SkipIfOnlyChanged: "file$",
+				},
+			},
+			ref:         "master",
+			fileChanges: []string{"onefile", "two-file", "pkg/controller/three_file.go"},
+			expectedRun: true,
+		},
+		{
+			name: "job with `always_run` explicitly set to true will run",
+			job: Postsubmit{
+				AlwaysRun: &true_,
+			},
+			ref:         "master",
+			expectedRun: true,
+		},
+		{
+			name: "job with `always_run` explicitly set to false will not run",
+			job: Postsubmit{
+				AlwaysRun: &false_,
+			},
+			ref:         "master",
+			expectedRun: false,
+		},
+		{
+			name: "job skipped on the branch will not run, even if `always_run` set to true explicitly",
+			job: Postsubmit{
+				AlwaysRun: &true_,
+				Brancher: Brancher{
+					SkipBranches: []string{"master"},
+				},
+			},
+			ref:         "master",
+			expectedRun: false,
+		},
+		{
+			name: "job enabled on the branch (with `always_run` explicitly set to false explicitly) will not run",
+			job: Postsubmit{
+				AlwaysRun: &false_,
+				Brancher: Brancher{
+					Branches: []string{"something"},
+				},
+			},
+			ref:         "something",
+			expectedRun: false,
 		},
 	}
 
@@ -1054,6 +1256,240 @@ func TestPostsubmitShouldRun(t *testing.T) {
 			}
 			if jobShouldRun != testCase.expectedRun {
 				t.Errorf("%s: did not determine if job should run correctly, expected %v but got %v", testCase.name, testCase.expectedRun, jobShouldRun)
+			}
+		})
+	}
+}
+
+func TestUtilityConfigValidation(t *testing.T) {
+	testCases := []struct {
+		id    string
+		valid bool
+		uc    UtilityConfig
+	}{
+		{
+			id:    "empty UtilityConfig, no error",
+			valid: true,
+			uc:    UtilityConfig{},
+		},
+		{
+			id: "clone_uri is a not valid, error",
+			uc: UtilityConfig{CloneURI: "://notvalidURI"},
+		},
+		{
+			id: "one of the clone_uri is not valid, error",
+			uc: UtilityConfig{
+				CloneURI: "://notvalidURI",
+				ExtraRefs: []prowapi.Refs{
+					{
+						Org:      "org1",
+						Repo:     "repo1",
+						BaseSHA:  "master",
+						CloneURI: "https://github.com/kubernetes/test-infra.git",
+					},
+					{
+						Org:      "org2",
+						Repo:     "repo2",
+						BaseSHA:  "master",
+						CloneURI: "://notvalidURI",
+					},
+				},
+			},
+		},
+		{
+			id:    "ssh_keys specified but clone_uri is empty, no error",
+			valid: true,
+			uc: UtilityConfig{
+				DecorationConfig: &prowapi.DecorationConfig{
+					SSHKeySecrets: []string{"ssh-secret"},
+				},
+			},
+		},
+		{
+			id: "ssh_keys specified but clone_uri is invalid, error",
+			uc: UtilityConfig{
+				CloneURI: "://notvalidURI",
+				DecorationConfig: &prowapi.DecorationConfig{
+					SSHKeySecrets: []string{"ssh-secret"},
+				},
+			},
+		},
+		{
+			id:    "ssh_keys specified and clone_uri is valid, no error",
+			valid: true,
+			uc: UtilityConfig{
+				CloneURI: "git@github.com:kubernetes/test-infra.git",
+				DecorationConfig: &prowapi.DecorationConfig{
+					SSHKeySecrets: []string{"ssh-secret"},
+				},
+			},
+		},
+		{
+			id:    "ssh_keys specified and all of clone_uri are valid, no error",
+			valid: true,
+			uc: UtilityConfig{
+				CloneURI: "git@github.com:kubernetes/test-infra.git",
+				ExtraRefs: []prowapi.Refs{
+					{
+						Org:      "org1",
+						Repo:     "repo1",
+						BaseSHA:  "master",
+						CloneURI: "github.com:org1/repo1.git",
+					},
+					{
+						Org:      "org2",
+						Repo:     "repo2",
+						BaseSHA:  "master",
+						CloneURI: "git@github.com:org2/repo2.git",
+					},
+				},
+				DecorationConfig: &prowapi.DecorationConfig{
+					SSHKeySecrets: []string{"ssh-secret"},
+				},
+			},
+		},
+		{
+			id: "ssh_keys specified and one of the clone_uri is invalid, error",
+			uc: UtilityConfig{
+				CloneURI: "git@github.com:kubernetes/test-infra.git",
+				ExtraRefs: []prowapi.Refs{
+					{
+						Org:      "org1",
+						Repo:     "repo1",
+						BaseSHA:  "master",
+						CloneURI: "git@github.com:org1/repo1.git",
+					},
+					{
+						Org:      "org2",
+						Repo:     "repo2",
+						BaseSHA:  "master",
+						CloneURI: "://notvalidURI",
+					},
+				},
+				DecorationConfig: &prowapi.DecorationConfig{
+					SSHKeySecrets: []string{"ssh-secret"},
+				},
+			},
+		},
+		{
+			id: "clone_uri contains a user and decoration config is nil, no error",
+			uc: UtilityConfig{
+				CloneURI: "git@github.com:kubernetes/test-infra.git",
+			},
+			valid: true,
+		},
+		{
+			id: "oauth token secret provided and all clone_uri have valid http(s) a scheme, no error",
+			uc: UtilityConfig{
+				DecorationConfig: &prowapi.DecorationConfig{
+					OauthTokenSecret: &prowapi.OauthTokenSecret{
+						Name: "secret",
+						Key:  "token",
+					},
+				},
+				CloneURI: "http://github.com/kubernetes/test-infra.git",
+				ExtraRefs: []prowapi.Refs{
+					{
+						Org:      "org1",
+						Repo:     "repo1",
+						BaseSHA:  "master",
+						CloneURI: "https://github.com/org1/repo1.git",
+					},
+					{
+						Org:      "org2",
+						Repo:     "repo2",
+						BaseSHA:  "master",
+						CloneURI: "http://github.com/org1/repo1.git",
+					},
+				},
+			},
+			valid: true,
+		},
+		{
+			id: "oauth token secret provided but clone_uri doesn't contain a scheme, error",
+			uc: UtilityConfig{
+				DecorationConfig: &prowapi.DecorationConfig{
+					OauthTokenSecret: &prowapi.OauthTokenSecret{
+						Name: "secret",
+						Key:  "token",
+					},
+				},
+				CloneURI: "github.com/kubernetes/test-infra.git",
+			},
+		},
+		{
+			id: "oauth token secret provided but one of the clone_uri doesn't contain a scheme, error",
+			uc: UtilityConfig{
+				DecorationConfig: &prowapi.DecorationConfig{
+					OauthTokenSecret: &prowapi.OauthTokenSecret{
+						Name: "secret",
+						Key:  "token",
+					},
+				},
+				CloneURI: "https://github.com/kubernetes/test-infra.git",
+				ExtraRefs: []prowapi.Refs{
+					{
+						Org:      "org1",
+						Repo:     "repo1",
+						BaseSHA:  "master",
+						CloneURI: "github.com/org1/repo1.git",
+					},
+					{
+						Org:      "org2",
+						Repo:     "repo2",
+						BaseSHA:  "master",
+						CloneURI: "http://github.com/org1/repo1.git",
+					},
+				},
+			},
+		},
+		{
+			id: "oauth token secret provided but clone_uri doesn't contain a http(s) scheme, error",
+			uc: UtilityConfig{
+				DecorationConfig: &prowapi.DecorationConfig{
+					OauthTokenSecret: &prowapi.OauthTokenSecret{
+						Name: "secret",
+						Key:  "token",
+					},
+				},
+				CloneURI: "ssh://github.com/kubernetes/test-infra.git",
+			},
+		},
+		{
+			id: "oauth token secret provided but one of the clone_uri doesn't contain a http(s) scheme, error",
+			uc: UtilityConfig{
+				DecorationConfig: &prowapi.DecorationConfig{
+					OauthTokenSecret: &prowapi.OauthTokenSecret{
+						Name: "secret",
+						Key:  "token",
+					},
+				},
+				CloneURI: "https://github.com/kubernetes/test-infra.git",
+				ExtraRefs: []prowapi.Refs{
+					{
+						Org:      "org1",
+						Repo:     "repo1",
+						BaseSHA:  "master",
+						CloneURI: "ssh://git@github.com:org1/repo1.git",
+					},
+					{
+						Org:      "org2",
+						Repo:     "repo2",
+						BaseSHA:  "master",
+						CloneURI: "http://github.com/org1/repo1.git",
+					},
+				},
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.id, func(t *testing.T) {
+			if err := tc.uc.Validate(); err != nil && tc.valid {
+				t.Fatalf("No validation error expected: %v", err)
+			}
+			if err := tc.uc.Validate(); err == nil && !tc.valid {
+				t.Fatalf("Validation error expected: %v", err)
 			}
 		})
 	}

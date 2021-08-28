@@ -55,7 +55,7 @@ type TokenHandler struct {
 func GetGitHubClient(token string) *github.Client {
 	return github.NewClient(
 		oauth2.NewClient(
-			oauth2.NoContext,
+			context.Background(),
 			oauth2.StaticTokenSource(&oauth2.Token{AccessToken: token}),
 		),
 	)
@@ -129,7 +129,7 @@ func (t TokenHandler) Process() {
 	}
 
 	for {
-		halfPeriod := lastRate.Reset.Time.Sub(time.Now()) / 2
+		halfPeriod := time.Until(lastRate.Reset.Time) / 2
 		time.Sleep(halfPeriod)
 		newRate, err := t.getCoreRate()
 		if err != nil {

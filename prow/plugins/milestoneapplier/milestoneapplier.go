@@ -24,6 +24,7 @@ import (
 
 	"github.com/sirupsen/logrus"
 
+	"k8s.io/test-infra/prow/config"
 	"k8s.io/test-infra/prow/github"
 	"k8s.io/test-infra/prow/pluginhelp"
 	"k8s.io/test-infra/prow/plugins"
@@ -41,21 +42,32 @@ func init() {
 	plugins.RegisterPullRequestHandler(pluginName, handlePullRequest, helpProvider)
 }
 
-func helpProvider(config *plugins.Configuration, enabledRepos []string) (*pluginhelp.PluginHelp, error) {
+func helpProvider(config *plugins.Configuration, enabledRepos []config.OrgRepo) (*pluginhelp.PluginHelp, error) {
 	configInfo := map[string]string{}
-	for _, orgRepo := range enabledRepos {
+	for _, repo := range enabledRepos {
 		var branchesToMilestone []string
-		for branch, milestone := range config.MilestoneApplier[orgRepo] {
+		for branch, milestone := range config.MilestoneApplier[repo.String()] {
 			branchesToMilestone = append(branchesToMilestone, fmt.Sprintf("- `%s`: `%s`", branch, milestone))
 		}
-		configInfo[orgRepo] = fmt.Sprintf("The configured branches and milestones for this repo are:\n%s", strings.Join(branchesToMilestone, "\n"))
-
+		configInfo[repo.String()] = fmt.Sprintf("The configured branches and milestones for this repo are:\n%s", strings.Join(branchesToMilestone, "\n"))
 	}
 
 	// The {WhoCanUse, Usage, Examples} fields are omitted because this plugin is not triggered with commands.
+	yamlSnippet, err := plugins.CommentMap.GenYaml(&plugins.Configuration{
+		MilestoneApplier: map[string]plugins.BranchToMilestone{
+			"kubernetes/kubernetes": {
+				"release-1.19": "v1.19",
+				"release-1.18": "v1.18",
+			},
+		},
+	})
+	if err != nil {
+		logrus.WithError(err).Warnf("cannot generate comments for %s plugin", pluginName)
+	}
 	return &pluginhelp.PluginHelp{
 		Description: "The milestoneapplier plugin automatically applies the configured milestone for the base branch after a PR is merged. If a PR targets a non-default branch, it also adds the milestone when the PR is opened.",
 		Config:      configInfo,
+		Snippet:     yamlSnippet,
 	}, nil
 }
 

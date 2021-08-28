@@ -33,11 +33,14 @@ import (
 	"github.com/sirupsen/logrus"
 	"k8s.io/apimachinery/pkg/runtime"
 	clienttesting "k8s.io/client-go/testing"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	prowapi "k8s.io/test-infra/prow/apis/prowjobs/v1"
 	"k8s.io/test-infra/prow/client/clientset/versioned/fake"
 	"k8s.io/test-infra/prow/config"
-	"k8s.io/test-infra/prow/pubsub/reporter"
+	reporter "k8s.io/test-infra/prow/crier/reporters/pubsub"
+
+	v1 "k8s.io/api/core/v1"
 )
 
 type pubSubTestClient struct {
@@ -91,7 +94,7 @@ func (c *pubSubTestClient) new(ctx context.Context, project string) (pubsubClien
 	return c, nil
 }
 
-func (c *pubSubTestClient) subscription(id string) subscriptionInterface {
+func (c *pubSubTestClient) subscription(id string, maxOutstandingMessages int) subscriptionInterface {
 	return &fakeSubscription{name: id, messageChan: c.messageChan}
 }
 
@@ -99,17 +102,17 @@ type fakeReporter struct {
 	reported bool
 }
 
-func (r *fakeReporter) Report(pj *prowapi.ProwJob) ([]*prowapi.ProwJob, error) {
+func (r *fakeReporter) Report(_ context.Context, _ *logrus.Entry, pj *prowapi.ProwJob) ([]*prowapi.ProwJob, *reconcile.Result, error) {
 	r.reported = true
-	return nil, nil
+	return nil, nil, nil
 }
 
-func (r *fakeReporter) ShouldReport(pj *prowapi.ProwJob) bool {
+func (r *fakeReporter) ShouldReport(_ context.Context, _ *logrus.Entry, pj *prowapi.ProwJob) bool {
 	return pj.Annotations[reporter.PubSubProjectLabel] != "" && pj.Annotations[reporter.PubSubTopicLabel] != ""
 }
 
-func TestPeriodicProwJobEvent_ToFromMessage(t *testing.T) {
-	pe := PeriodicProwJobEvent{
+func TestProwJobEvent_ToFromMessage(t *testing.T) {
+	pe := ProwJobEvent{
 		Annotations: map[string]string{
 			reporter.PubSubProjectLabel: "project",
 			reporter.PubSubTopicLabel:   "topic",
@@ -128,7 +131,7 @@ func TestPeriodicProwJobEvent_ToFromMessage(t *testing.T) {
 	if m.Attributes[prowEventType] != periodicProwJobEvent {
 		t.Errorf("%s should be %s found %s instead", prowEventType, periodicProwJobEvent, m.Attributes[prowEventType])
 	}
-	var newPe PeriodicProwJobEvent
+	var newPe ProwJobEvent
 	if err = newPe.FromPayload(m.Data); err != nil {
 		t.Error(err)
 	}
@@ -141,7 +144,7 @@ func TestHandleMessage(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
 		msg    *pubSubMessage
-		pe     *PeriodicProwJobEvent
+		pe     *ProwJobEvent
 		s      string
 		config *config.Config
 		err    string
@@ -149,7 +152,7 @@ func TestHandleMessage(t *testing.T) {
 	}{
 		{
 			name: "PeriodicJobNoPubsub",
-			pe: &PeriodicProwJobEvent{
+			pe: &ProwJobEvent{
 				Name: "test",
 			},
 			config: &config.Config{
@@ -174,7 +177,7 @@ func TestHandleMessage(t *testing.T) {
 				},
 			},
 			config: &config.Config{},
-			err:    "unsupported event type",
+			err:    "unsupported event type: unsupported",
 			labels: []string{reporter.PubSubTopicLabel, reporter.PubSubRunIDLabel, reporter.PubSubProjectLabel},
 		},
 		{
@@ -205,9 +208,9 @@ func TestHandleMessage(t *testing.T) {
 				m.ID = "id"
 				tc.msg = &pubSubMessage{*m}
 			}
-			if err := s.handleMessage(tc.msg, tc.s); err != nil {
+			if err := s.handleMessage(tc.msg, tc.s, []string{"*"}); err != nil {
 				if err.Error() != tc.err {
-					t1.Errorf("Expected error %v got %v", tc.err, err.Error())
+					t1.Errorf("Expected error '%v' got '%v'", tc.err, err.Error())
 				} else if tc.err == "" {
 					var created []*prowapi.ProwJob
 					for _, action := range fakeProwJobClient.Fake.Actions() {
@@ -232,19 +235,51 @@ func TestHandleMessage(t *testing.T) {
 	}
 }
 
+func CheckProwJob(pe *ProwJobEvent, pj *prowapi.ProwJob) error {
+	// checking labels
+	for label, value := range pe.Labels {
+		if pj.Labels[label] != value {
+			return fmt.Errorf("label %s should be set to %s, found %s instead", label, value, pj.Labels[label])
+		}
+	}
+	// Checking Annotations
+	for annotation, value := range pe.Annotations {
+		if pj.Annotations[annotation] != value {
+			return fmt.Errorf("annotation %s should be set to %s, found %s instead", annotation, value, pj.Annotations[annotation])
+		}
+	}
+	if pj.Spec.PodSpec != nil {
+		// Checking Envs
+		for _, container := range pj.Spec.PodSpec.Containers {
+			envs := map[string]string{}
+			for _, env := range container.Env {
+				envs[env.Name] = env.Value
+			}
+			for env, value := range pe.Envs {
+				if envs[env] != value {
+					return fmt.Errorf("env %s should be set to %s, found %s instead", env, value, pj.Annotations[env])
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
 func TestHandlePeriodicJob(t *testing.T) {
 	for _, tc := range []struct {
-		name        string
-		pe          *PeriodicProwJobEvent
-		s           string
-		config      *config.Config
-		err         string
-		reported    bool
-		clientFails bool
+		name            string
+		pe              *ProwJobEvent
+		s               string
+		config          *config.Config
+		allowedClusters []string
+		err             string
+		reported        bool
+		clientFails     bool
 	}{
 		{
 			name: "PeriodicJobNoPubsub",
-			pe: &PeriodicProwJobEvent{
+			pe: &ProwJobEvent{
 				Name: "test",
 			},
 			config: &config.Config{
@@ -258,16 +293,72 @@ func TestHandlePeriodicJob(t *testing.T) {
 					},
 				},
 			},
+			allowedClusters: []string{"*"},
 		},
 		{
 			name: "PeriodicJobPubsubSet",
-			pe: &PeriodicProwJobEvent{
+			pe: &ProwJobEvent{
 				Name: "test",
 				Annotations: map[string]string{
 					reporter.PubSubProjectLabel: "project",
 					reporter.PubSubRunIDLabel:   "runid",
 					reporter.PubSubTopicLabel:   "topic",
 				},
+				Labels: map[string]string{
+					"label1": "label1",
+					"label2": "label2",
+				},
+				Envs: map[string]string{
+					"env1": "env1",
+					"env2": "env2",
+				},
+			},
+			config: &config.Config{
+				JobConfig: config.JobConfig{
+					Periodics: []config.Periodic{
+						{
+							JobBase: config.JobBase{
+								Name:        "test",
+								Labels:      map[string]string{},
+								Annotations: map[string]string{},
+								Spec: &v1.PodSpec{
+									Containers: []v1.Container{
+										{
+											Name: "test",
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			allowedClusters: []string{"*"},
+		},
+		{
+			name: "ClusterNotAllowed",
+			pe: &ProwJobEvent{
+				Name: "test",
+			},
+			config: &config.Config{
+				JobConfig: config.JobConfig{
+					Periodics: []config.Periodic{
+						{
+							JobBase: config.JobBase{
+								Name:    "test",
+								Cluster: "precious-cluster",
+							},
+						},
+					},
+				},
+			},
+			allowedClusters: []string{"normal-cluster"},
+			err:             "cluster precious-cluster is not allowed. Can be fixed by defining this cluster under pubsub_triggers -> allowed_clusters",
+		},
+		{
+			name: "DefaultClusterNotAllowed",
+			pe: &ProwJobEvent{
+				Name: "test",
 			},
 			config: &config.Config{
 				JobConfig: config.JobConfig{
@@ -280,10 +371,12 @@ func TestHandlePeriodicJob(t *testing.T) {
 					},
 				},
 			},
+			allowedClusters: []string{"normal-cluster"},
+			err:             "cluster  is not allowed. Can be fixed by defining this cluster under pubsub_triggers -> allowed_clusters",
 		},
 		{
 			name: "PeriodicJobPubsubSetCreationError",
-			pe: &PeriodicProwJobEvent{
+			pe: &ProwJobEvent{
 				Name: "test",
 				Annotations: map[string]string{
 					reporter.PubSubProjectLabel: "project",
@@ -302,21 +395,23 @@ func TestHandlePeriodicJob(t *testing.T) {
 					},
 				},
 			},
-			err:         "failed to create prowjob",
-			clientFails: true,
-			reported:    true,
+			allowedClusters: []string{"*"},
+			err:             "failed to create prowjob",
+			clientFails:     true,
+			reported:        true,
 		},
 		{
 			name: "JobNotFound",
-			pe: &PeriodicProwJobEvent{
+			pe: &ProwJobEvent{
 				Name: "test",
 			},
-			config: &config.Config{},
-			err:    "failed to find associated periodic job \"test\"",
+			config:          &config.Config{},
+			allowedClusters: []string{"*"},
+			err:             "failed to find associated periodic job \"test\"",
 		},
 		{
 			name: "JobNotFoundReportNeeded",
-			pe: &PeriodicProwJobEvent{
+			pe: &ProwJobEvent{
 				Name: "test",
 				Annotations: map[string]string{
 					reporter.PubSubProjectLabel: "project",
@@ -324,9 +419,10 @@ func TestHandlePeriodicJob(t *testing.T) {
 					reporter.PubSubTopicLabel:   "topic",
 				},
 			},
-			config:   &config.Config{},
-			err:      "failed to find associated periodic job \"test\"",
-			reported: true,
+			config:          &config.Config{},
+			allowedClusters: []string{"*"},
+			err:             "failed to find associated periodic job \"test\"",
+			reported:        true,
 		},
 	} {
 		t.Run(tc.name, func(t1 *testing.T) {
@@ -351,24 +447,29 @@ func TestHandlePeriodicJob(t *testing.T) {
 				t.Error(err)
 			}
 			m.ID = "id"
-			if err := s.handlePeriodicJob(logrus.NewEntry(logrus.New()), &pubSubMessage{*m}, tc.s); err != nil {
+			err = s.handleProwJob(logrus.NewEntry(logrus.New()), &periodicJobHandler{}, &pubSubMessage{*m}, tc.s, tc.allowedClusters)
+			if err != nil {
 				if err.Error() != tc.err {
-					t1.Errorf("Expected error %v got %v", tc.err, err.Error())
-				} else if tc.err == "" {
-					var created []*prowapi.ProwJob
-					for _, action := range fakeProwJobClient.Fake.Actions() {
-						switch action := action.(type) {
-						case clienttesting.CreateActionImpl:
-							if prowjob, ok := action.Object.(*prowapi.ProwJob); ok {
-								created = append(created, prowjob)
+					t1.Errorf("Expected error '%v' got '%v'", tc.err, err.Error())
+				}
+			} else if tc.err == "" {
+				var created []*prowapi.ProwJob
+				for _, action := range fakeProwJobClient.Fake.Actions() {
+					switch action := action.(type) {
+					case clienttesting.CreateActionImpl:
+						if prowjob, ok := action.Object.(*prowapi.ProwJob); ok {
+							created = append(created, prowjob)
+							if err := CheckProwJob(tc.pe, prowjob); err != nil {
+								t.Error(err)
 							}
 						}
 					}
-					if len(created) != 1 {
-						t.Errorf("Expected to create 1 ProwJobs, got %d", len(created))
-					}
+				}
+				if len(created) != 1 {
+					t.Errorf("Expected to create 1 ProwJobs, got %d", len(created))
 				}
 			}
+
 			if fr.reported != tc.reported {
 				t1.Errorf("Expected Reporting: %t, found: %t", tc.reported, fr.reported)
 			}
@@ -382,7 +483,7 @@ func TestPushServer_ServeHTTP(t *testing.T) {
 		url          string
 		secret       string
 		pushRequest  interface{}
-		pe           *PeriodicProwJobEvent
+		pe           *ProwJobEvent
 		expectedCode int
 	}{
 		{
@@ -429,7 +530,7 @@ func TestPushServer_ServeHTTP(t *testing.T) {
 			secret:      "secret",
 			url:         "https://prow.k8s.io/push?token=secret",
 			pushRequest: pushRequest{},
-			pe: &PeriodicProwJobEvent{
+			pe: &ProwJobEvent{
 				Name: "test",
 			},
 			expectedCode: http.StatusOK,
@@ -438,7 +539,7 @@ func TestPushServer_ServeHTTP(t *testing.T) {
 			name:        "SuccessNoToken",
 			url:         "https://prow.k8s.io/push",
 			pushRequest: pushRequest{},
-			pe: &PeriodicProwJobEvent{
+			pe: &ProwJobEvent{
 				Name: "test",
 			},
 			expectedCode: http.StatusOK,
@@ -536,8 +637,12 @@ func TestPullServer_RunHandlePullFail(t *testing.T) {
 	}
 	c := &config.Config{
 		ProwConfig: config.ProwConfig{
-			PubSubSubscriptions: map[string][]string{
-				"project": {"test"},
+			PubSubTriggers: []config.PubSubTrigger{
+				{
+					Project:         "project",
+					Topics:          []string{"test"},
+					AllowedClusters: []string{"*"},
+				},
 			},
 		},
 	}
@@ -589,8 +694,12 @@ func TestPullServer_RunConfigChange(t *testing.T) {
 	case <-time.After(10 * time.Millisecond):
 		newConfig := &config.Config{
 			ProwConfig: config.ProwConfig{
-				PubSubSubscriptions: map[string][]string{
-					"project": {"test"},
+				PubSubTriggers: []config.PubSubTrigger{
+					{
+						Project:         "project",
+						Topics:          []string{"test"},
+						AllowedClusters: []string{"*"},
+					},
 				},
 			},
 		}

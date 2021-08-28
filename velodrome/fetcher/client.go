@@ -87,7 +87,7 @@ func (client *Client) getGitHubClient() (*github.Client, error) {
 
 	if len(token) > 0 {
 		ts := oauth2.StaticTokenSource(&oauth2.Token{AccessToken: token})
-		tc := oauth2.NewClient(oauth2.NoContext, ts)
+		tc := oauth2.NewClient(context.Background(), ts)
 		client.githubClient = github.NewClient(tc)
 	} else {
 		client.githubClient = github.NewClient(nil)
@@ -109,7 +109,7 @@ func (client *Client) limitsCheckAndWait() {
 			sleep = time.Minute
 		}
 		if limits != nil && limits.Core != nil && limits.Core.Remaining < tokenLimit {
-			sleep = limits.Core.Reset.Sub(time.Now())
+			sleep = time.Until(limits.Core.Reset.Time)
 			glog.Warning("RateLimits: reached. Sleeping for ", sleep)
 		}
 	}
