@@ -3,11 +3,20 @@
 filters:
   ".*":
     approvers:
+      - sig-contributor-experience-technical-leads
       - cblecker
-      - spiffxp
+    reviewers:
+      - sig-contributor-experience-technical-leads
+      - cblecker
+      - smg247
+      - danilo-gemoli
+      - droslean
+    emeritus_approvers:
       - fejta
+      - spiffxp
     labels:
       - area/label_sync
+      - sig/contributor-experience
   "labels\\.yaml":
     required_reviewers:
-      - cblecker
+      - sig-contributor-experience-technical-leads

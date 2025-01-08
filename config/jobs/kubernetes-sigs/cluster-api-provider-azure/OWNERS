@@ -1,14 +1,16 @@
 # See the OWNERS docs at https://go.k8s.io/owners
 
 approvers:
-- andyzhangx
-- brendandburns
-- feiskyer
-- justaugustus
-- karataliu
-- khenidak
-- soggiest
+- jackfrancis
+- Jont828
+- mboersma
+- nawazkh
+- nojnhuh
+- willie-yao
 reviewers:
-- awesomenix
-- juan-lee
-- serbrech
+- jsturtevant
+- marosset
+
+labels:
+- sig/cluster-lifecycle
+- area/provider/azure

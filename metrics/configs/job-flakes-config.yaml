@@ -20,7 +20,7 @@ query: |
       select /* Count the runs and passes for each (job, pr-num, commit) */
         max(stamp) stamp,
         num,
-        if(kind = "pull", commit, version) commit,
+        if(kind = "pull", if(commit is NULL, version, commit), version) commit,
         sum(if(result=='SUCCESS',1,0)) passed,
         count(result) runs
       from (
@@ -33,7 +33,7 @@ query: |
           date(started) stamp,
           date(date_add(date(started), -dayofweek(started), "day")) wk, /* TODO(fejta): remove or use */
           result
-        FROM [k8s-gubernator:build.all]
+        FROM [kubernetes-public:k8s_infra_kettle.all]
         where
           started > date_add(current_timestamp(), -7, "DAY")
           and version != "unknown"
@@ -51,7 +51,7 @@ query: |
 
 jqfilter: |
   [(.[] | select(.job | contains("pr:")) | {(.job): {
-      flakes: (.flakes|tonumber),
-      runs: (.runs|tonumber),
-      consistency: (.commit_consistency|tonumber)
+      flakes: (.flakes//0|tonumber),
+      runs: (.runs//0|tonumber),
+      consistency: (.commit_consistency//0|tonumber)
   }})] | add

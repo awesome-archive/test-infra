@@ -1,15 +1,19 @@
-# See the OWNERS file documentation:
-#  https://github.com/kubernetes/community/blob/master/contributors/devel/owners.md
-
+# See the OWNERS docs at https://go.k8s.io/owners
 approvers:
-- luxas
-- timothysc
-- fabriziopandini
+- carlory
 - neolit123
+- SataQiu
+- pacoxu
 reviewers:
+- carlory
+- fabriziopandini
+- HirazawaUi
+- neolit123
+- SataQiu
+- pacoxu
+emeritus_approvers:
+- fabriziopandini
 - luxas
 - timothysc
-- fabriziopandini
-- neolit123
 labels:
 - sig/cluster-lifecycle

@@ -2,7 +2,8 @@
 
 presubmits:
   kubernetes-csi/node-driver-registrar:
-  - name: pull-kubernetes-csi-node-driver-registrar-1-14-on-kubernetes-1-14
+  - name: pull-kubernetes-csi-node-driver-registrar-1-30-on-kubernetes-1-30
+    cluster: eks-prow-build-cluster
     always_run: true
     optional: false
     decorate: true
@@ -12,10 +13,14 @@ presubmits:
       preset-service-account: "true"
       preset-dind-enabled: "true"
       preset-kind-volume-mounts: "true"
+    annotations:
+      testgrid-dashboards: sig-storage-csi-node-driver-registrar
+      testgrid-tab-name: 1-30-on-kubernetes-1-30
+      description: Kubernetes-CSI pull job in repo node-driver-registrar for non-alpha tests, using deployment 1.30 on Kubernetes 1.30
     spec:
       containers:
       # We need this image because it has Docker in Docker and go.
-      - image: gcr.io/k8s-testimages/kubekins-e2e:v20190920-5a67b1f-master
+      - image: gcr.io/k8s-staging-test-infra/kubekins-e2e:v20241230-3006692a6f-master
         command:
         - runner.sh
         args:
@@ -25,11 +30,17 @@ presubmits:
         # Update only when the newer version is known to not cause issues,
         # otherwise presubmit jobs may start to fail for reasons that are
         # unrelated to the PR. Testing against the latest Kubernetes is covered
-        # by periodic jobs (see https://k8s-testgrid.appspot.com/sig-storage-csi#Summary).
+        # by periodic jobs (see https://testgrid.k8s.io/sig-storage-csi-ci#Summary).
         - name: CSI_PROW_KUBERNETES_VERSION
-          value: "1.14.0"
+          value: "1.30.0"
         - name: CSI_PROW_KUBERNETES_DEPLOYMENT
-          value: "1.14"
+          value: "1.30"
+        - name: CSI_PROW_DEPLOYMENT_SUFFIX
+          value: ""
+        - name: CSI_PROW_DRIVER_VERSION
+          value: "v1.15.0"
+        - name: CSI_SNAPSHOTTER_VERSION
+          value: "v6.1.0"
         - name: CSI_PROW_TESTS
           value: "sanity serial parallel"
         # docker-in-docker needs privileged mode
@@ -37,11 +48,16 @@ presubmits:
           privileged: true
         resources:
           requests:
-            cpu: 2000m
-  - name: pull-kubernetes-csi-node-driver-registrar-1-14-on-kubernetes-master
+            memory: "9Gi"
+            cpu: 4
+          limits:
+            memory: "9Gi"
+            cpu: 4
+  - name: pull-kubernetes-csi-node-driver-registrar-1-30-on-kubernetes-master
     # Explicitly needs to be started with /test.
     # This cannot be enabled by default because there's always the risk
     # that something changes in master which breaks the pre-merge check.
+    cluster: eks-prow-build-cluster
     always_run: false
     optional: true
     decorate: true
@@ -49,12 +65,15 @@ presubmits:
     labels:
       preset-service-account: "true"
       preset-dind-enabled: "true"
-      preset-bazel-remote-cache-enabled: "true"
       preset-kind-volume-mounts: "true"
+    annotations:
+      testgrid-dashboards: sig-storage-csi-node-driver-registrar
+      testgrid-tab-name: 1-30-on-kubernetes-master
+      description: Kubernetes-CSI pull job in repo node-driver-registrar for non-alpha tests, using deployment 1.30 on Kubernetes master
     spec:
       containers:
       # We need this image because it has Docker in Docker and go.
-      - image: gcr.io/k8s-testimages/kubekins-e2e:v20190920-5a67b1f-master
+      - image: gcr.io/k8s-staging-test-infra/kubekins-e2e:v20241230-3006692a6f-master
         command:
         - runner.sh
         args:
@@ -62,19 +81,26 @@ presubmits:
         env:
         - name: CSI_PROW_KUBERNETES_VERSION
           value: "latest"
+        - name: CSI_PROW_DRIVER_VERSION
+          value: "v1.15.0"
+        - name: CSI_PROW_DEPLOYMENT_SUFFIX
+          value: ""
+        - name: CSI_SNAPSHOTTER_VERSION
+          value: "master"
         - name: CSI_PROW_TESTS
           value: "sanity serial parallel"
         # docker-in-docker needs privileged mode
         securityContext:
           privileged: true
-      resources:
-        requests:
-          # these are both a bit below peak usage during build
-          # this is mostly for building kubernetes
-          memory: "9000Mi"
-          # during the tests more like 3-20m is used
-          cpu: 2000m
-  - name: pull-kubernetes-csi-node-driver-registrar-1-15-on-kubernetes-1-15
+        resources:
+          requests:
+            memory: "9Gi"
+            cpu: 4
+          limits:
+            memory: "9Gi"
+            cpu: 4
+  - name: pull-kubernetes-csi-node-driver-registrar-1-31-on-kubernetes-1-31
+    cluster: eks-prow-build-cluster
     always_run: true
     optional: false
     decorate: true
@@ -84,10 +110,14 @@ presubmits:
       preset-service-account: "true"
       preset-dind-enabled: "true"
       preset-kind-volume-mounts: "true"
+    annotations:
+      testgrid-dashboards: sig-storage-csi-node-driver-registrar
+      testgrid-tab-name: 1-31-on-kubernetes-1-31
+      description: Kubernetes-CSI pull job in repo node-driver-registrar for non-alpha tests, using deployment 1.31 on Kubernetes 1.31
     spec:
       containers:
       # We need this image because it has Docker in Docker and go.
-      - image: gcr.io/k8s-testimages/kubekins-e2e:v20190920-5a67b1f-master
+      - image: gcr.io/k8s-staging-test-infra/kubekins-e2e:v20241230-3006692a6f-master
         command:
         - runner.sh
         args:
@@ -97,11 +127,17 @@ presubmits:
         # Update only when the newer version is known to not cause issues,
         # otherwise presubmit jobs may start to fail for reasons that are
         # unrelated to the PR. Testing against the latest Kubernetes is covered
-        # by periodic jobs (see https://k8s-testgrid.appspot.com/sig-storage-csi#Summary).
+        # by periodic jobs (see https://testgrid.k8s.io/sig-storage-csi-ci#Summary).
         - name: CSI_PROW_KUBERNETES_VERSION
-          value: "1.15.0"
+          value: "1.31.0"
         - name: CSI_PROW_KUBERNETES_DEPLOYMENT
-          value: "1.15"
+          value: "1.31"
+        - name: CSI_PROW_DEPLOYMENT_SUFFIX
+          value: ""
+        - name: CSI_PROW_DRIVER_VERSION
+          value: "v1.15.0"
+        - name: CSI_SNAPSHOTTER_VERSION
+          value: "v6.1.0"
         - name: CSI_PROW_TESTS
           value: "sanity serial parallel"
         # docker-in-docker needs privileged mode
@@ -109,11 +145,16 @@ presubmits:
           privileged: true
         resources:
           requests:
-            cpu: 2000m
-  - name: pull-kubernetes-csi-node-driver-registrar-1-15-on-kubernetes-master
+            memory: "9Gi"
+            cpu: 4
+          limits:
+            memory: "9Gi"
+            cpu: 4
+  - name: pull-kubernetes-csi-node-driver-registrar-1-31-on-kubernetes-master
     # Explicitly needs to be started with /test.
     # This cannot be enabled by default because there's always the risk
     # that something changes in master which breaks the pre-merge check.
+    cluster: eks-prow-build-cluster
     always_run: false
     optional: true
     decorate: true
@@ -121,12 +162,15 @@ presubmits:
     labels:
       preset-service-account: "true"
       preset-dind-enabled: "true"
-      preset-bazel-remote-cache-enabled: "true"
       preset-kind-volume-mounts: "true"
+    annotations:
+      testgrid-dashboards: sig-storage-csi-node-driver-registrar
+      testgrid-tab-name: 1-31-on-kubernetes-master
+      description: Kubernetes-CSI pull job in repo node-driver-registrar for non-alpha tests, using deployment 1.31 on Kubernetes master
     spec:
       containers:
       # We need this image because it has Docker in Docker and go.
-      - image: gcr.io/k8s-testimages/kubekins-e2e:v20190920-5a67b1f-master
+      - image: gcr.io/k8s-staging-test-infra/kubekins-e2e:v20241230-3006692a6f-master
         command:
         - runner.sh
         args:
@@ -134,19 +178,123 @@ presubmits:
         env:
         - name: CSI_PROW_KUBERNETES_VERSION
           value: "latest"
+        - name: CSI_PROW_DRIVER_VERSION
+          value: "v1.15.0"
+        - name: CSI_PROW_DEPLOYMENT_SUFFIX
+          value: ""
+        - name: CSI_SNAPSHOTTER_VERSION
+          value: "master"
         - name: CSI_PROW_TESTS
           value: "sanity serial parallel"
         # docker-in-docker needs privileged mode
         securityContext:
           privileged: true
-      resources:
-        requests:
-          # these are both a bit below peak usage during build
-          # this is mostly for building kubernetes
-          memory: "9000Mi"
-          # during the tests more like 3-20m is used
-          cpu: 2000m
-  - name: pull-kubernetes-csi-node-driver-registrar-alpha-1-15-on-kubernetes-1-15
+        resources:
+          requests:
+            memory: "9Gi"
+            cpu: 4
+          limits:
+            memory: "9Gi"
+            cpu: 4
+  - name: pull-kubernetes-csi-node-driver-registrar-1-32-on-kubernetes-1-32
+    cluster: eks-prow-build-cluster
+    always_run: true
+    optional: true
+    decorate: true
+    skip_report: false
+    skip_branches: ["^(release-1.0)$"]
+    labels:
+      preset-service-account: "true"
+      preset-dind-enabled: "true"
+      preset-kind-volume-mounts: "true"
+    annotations:
+      testgrid-dashboards: sig-storage-csi-node-driver-registrar
+      testgrid-tab-name: 1-32-on-kubernetes-1-32
+      description: Kubernetes-CSI pull job in repo node-driver-registrar for non-alpha tests, using deployment 1.32 on Kubernetes 1.32
+    spec:
+      containers:
+      # We need this image because it has Docker in Docker and go.
+      - image: gcr.io/k8s-staging-test-infra/kubekins-e2e:v20241230-3006692a6f-master
+        command:
+        - runner.sh
+        args:
+        - ./.prow.sh
+        env:
+        # We pick some version for which there are pre-built images for kind.
+        # Update only when the newer version is known to not cause issues,
+        # otherwise presubmit jobs may start to fail for reasons that are
+        # unrelated to the PR. Testing against the latest Kubernetes is covered
+        # by periodic jobs (see https://testgrid.k8s.io/sig-storage-csi-ci#Summary).
+        - name: CSI_PROW_KUBERNETES_VERSION
+          value: "1.32.0"
+        - name: CSI_PROW_KUBERNETES_DEPLOYMENT
+          value: "1.32"
+        - name: CSI_PROW_DEPLOYMENT_SUFFIX
+          value: ""
+        - name: CSI_PROW_DRIVER_VERSION
+          value: "v1.15.0"
+        - name: CSI_SNAPSHOTTER_VERSION
+          value: "v6.1.0"
+        - name: CSI_PROW_TESTS
+          value: "sanity serial parallel"
+        # docker-in-docker needs privileged mode
+        securityContext:
+          privileged: true
+        resources:
+          requests:
+            memory: "9Gi"
+            cpu: 4
+          limits:
+            memory: "9Gi"
+            cpu: 4
+  - name: pull-kubernetes-csi-node-driver-registrar-1-32-on-kubernetes-master
+    # Explicitly needs to be started with /test.
+    # This cannot be enabled by default because there's always the risk
+    # that something changes in master which breaks the pre-merge check.
+    cluster: eks-prow-build-cluster
+    always_run: false
+    optional: true
+    decorate: true
+    skip_report: false
+    labels:
+      preset-service-account: "true"
+      preset-dind-enabled: "true"
+      preset-kind-volume-mounts: "true"
+    annotations:
+      testgrid-dashboards: sig-storage-csi-node-driver-registrar
+      testgrid-tab-name: 1-32-on-kubernetes-master
+      description: Kubernetes-CSI pull job in repo node-driver-registrar for non-alpha tests, using deployment 1.32 on Kubernetes master
+    spec:
+      containers:
+      # We need this image because it has Docker in Docker and go.
+      - image: gcr.io/k8s-staging-test-infra/kubekins-e2e:v20241230-3006692a6f-master
+        command:
+        - runner.sh
+        args:
+        - ./.prow.sh
+        env:
+        - name: CSI_PROW_KUBERNETES_VERSION
+          value: "latest"
+        - name: CSI_PROW_DRIVER_VERSION
+          value: "v1.15.0"
+        - name: CSI_PROW_DEPLOYMENT_SUFFIX
+          value: ""
+        - name: CSI_SNAPSHOTTER_VERSION
+          value: "master"
+        - name: CSI_PROW_TESTS
+          value: "sanity serial parallel"
+        # docker-in-docker needs privileged mode
+        securityContext:
+          privileged: true
+        resources:
+          requests:
+            memory: "9Gi"
+            cpu: 4
+          limits:
+            memory: "9Gi"
+            cpu: 4
+  - name: pull-kubernetes-csi-node-driver-registrar-alpha-1-31-on-kubernetes-1-31
+    cluster: eks-prow-build-cluster
     always_run: false
     optional: true
     decorate: true
@@ -156,10 +304,14 @@ presubmits:
       preset-service-account: "true"
       preset-dind-enabled: "true"
       preset-kind-volume-mounts: "true"
+    annotations:
+      testgrid-dashboards: sig-storage-csi-node-driver-registrar
+      testgrid-tab-name: alpha-1-31-on-kubernetes-1-31
+      description: Kubernetes-CSI pull job in repo node-driver-registrar for alpha tests, using deployment 1.31 on Kubernetes 1.31
     spec:
       containers:
       # We need this image because it has Docker in Docker and go.
-      - image: gcr.io/k8s-testimages/kubekins-e2e:v20190920-5a67b1f-master
+      - image: gcr.io/k8s-staging-test-infra/kubekins-e2e:v20241230-3006692a6f-master
         command:
         - runner.sh
         args:
@@ -169,11 +321,17 @@ presubmits:
         # Update only when the newer version is known to not cause issues,
         # otherwise presubmit jobs may start to fail for reasons that are
         # unrelated to the PR. Testing against the latest Kubernetes is covered
-        # by periodic jobs (see https://k8s-testgrid.appspot.com/sig-storage-csi#Summary).
+        # by periodic jobs (see https://testgrid.k8s.io/sig-storage-csi-ci#Summary).
         - name: CSI_PROW_KUBERNETES_VERSION
-          value: "1.15.0"
+          value: "1.31.0"
         - name: CSI_PROW_KUBERNETES_DEPLOYMENT
-          value: "1.15"
+          value: "1.31"
+        - name: CSI_PROW_DEPLOYMENT_SUFFIX
+          value: ""
+        - name: CSI_PROW_DRIVER_VERSION
+          value: "v1.15.0"
+        - name: CSI_SNAPSHOTTER_VERSION
+          value: "v6.1.0"
         - name: CSI_PROW_TESTS
           value: "serial-alpha parallel-alpha"
         # docker-in-docker needs privileged mode
@@ -181,44 +339,13 @@ presubmits:
           privileged: true
         resources:
           requests:
-            cpu: 2000m
-  - name: pull-kubernetes-csi-node-driver-registrar-alpha-1-15-on-kubernetes-master
-    # Explicitly needs to be started with /test.
-    # This cannot be enabled by default because there's always the risk
-    # that something changes in master which breaks the pre-merge check.
-    always_run: false
-    optional: true
-    decorate: true
-    skip_report: false
-    labels:
-      preset-service-account: "true"
-      preset-dind-enabled: "true"
-      preset-bazel-remote-cache-enabled: "true"
-      preset-kind-volume-mounts: "true"
-    spec:
-      containers:
-      # We need this image because it has Docker in Docker and go.
-      - image: gcr.io/k8s-testimages/kubekins-e2e:v20190920-5a67b1f-master
-        command:
-        - runner.sh
-        args:
-        - ./.prow.sh
-        env:
-        - name: CSI_PROW_KUBERNETES_VERSION
-          value: "latest"
-        - name: CSI_PROW_TESTS
-          value: "serial-alpha parallel-alpha"
-        # docker-in-docker needs privileged mode
-        securityContext:
-          privileged: true
-      resources:
-        requests:
-          # these are both a bit below peak usage during build
-          # this is mostly for building kubernetes
-          memory: "9000Mi"
-          # during the tests more like 3-20m is used
-          cpu: 2000m
+            memory: "9Gi"
+            cpu: 4
+          limits:
+            memory: "9Gi"
+            cpu: 4
   - name: pull-kubernetes-csi-node-driver-registrar-unit
+    cluster: eks-prow-build-cluster
     always_run: true
     decorate: true
     skip_report: false
@@ -226,12 +353,15 @@ presubmits:
     labels:
       preset-service-account: "true"
       preset-dind-enabled: "true"
-      preset-bazel-remote-cache-enabled: "true"
       preset-kind-volume-mounts: "true"
+    annotations:
+      testgrid-dashboards: sig-storage-csi-node-driver-registrar
+      testgrid-tab-name: unit
+      description: Kubernetes-CSI pull job in repo node-driver-registrar for unit tests
     spec:
       containers:
       # We need this image because it has Docker in Docker and go.
-      - image: gcr.io/k8s-testimages/kubekins-e2e:v20190920-5a67b1f-master
+      - image: gcr.io/k8s-staging-test-infra/kubekins-e2e:v20241230-3006692a6f-master
         command:
         - runner.sh
         args:
@@ -242,10 +372,62 @@ presubmits:
         # docker-in-docker needs privileged mode
         securityContext:
           privileged: true
-      resources:
-        requests:
-          # these are both a bit below peak usage during build
-          # this is mostly for building kubernetes
-          memory: "9000Mi"
-          # during the tests more like 3-20m is used
-          cpu: 2000m
+        resources:
+          requests:
+            memory: "9Gi"
+            cpu: 4
+          limits:
+            memory: "9Gi"
+            cpu: 4
+
+  - name: pull-kubernetes-csi-node-driver-registrar-canary
+    cluster: eks-prow-build-cluster
+    optional: true
+    decorate: true
+    skip_report: false
+    skip_branches: ["^(release-1.0)$"]
+    labels:
+      preset-service-account: "true"
+      preset-dind-enabled: "true"
+      preset-kind-volume-mounts: "true"
+    annotations:
+      testgrid-dashboards: sig-storage-csi-node-driver-registrar
+      testgrid-tab-name: canary
+      description: Kubernetes-CSI pull job in repo node-driver-registrar for canary tests
+    spec:
+      containers:
+      # We need this image because it has Docker in Docker and go.
+      - image: gcr.io/k8s-staging-test-infra/kubekins-e2e:v20241230-3006692a6f-master
+        command:
+        - runner.sh
+        args:
+        - ./.prow.sh
+        env:
+        - name: CSI_PROW_KUBERNETES_VERSION
+          value: "latest"
+        - name: CSI_PROW_TESTS
+          value: "serial-alpha parallel-alpha"
+        - name: CSI_PROW_BUILD_JOB
+          value: "true"
+        - name: CSI_PROW_HOSTPATH_CANARY
+          value: "canary"
+        - name: CSI_SNAPSHOTTER_VERSION
+          value: "master"
+        - name: CSI_PROW_DRIVER_VERSION
+          value: "master"
+        # ... but the RBAC rules only when testing on master.
+        # The other jobs test against the unmodified deployment for
+        # that Kubernetes version, i.e. with the original RBAC rules.
+        - name: UPDATE_RBAC_RULES
+          value: "true"
+
+        # docker-in-docker needs privileged mode
+        securityContext:
+          privileged: true
+        resources:
+          requests:
+            memory: "9Gi"
+            cpu: 4
+          limits:
+            memory: "9Gi"
+            cpu: 4

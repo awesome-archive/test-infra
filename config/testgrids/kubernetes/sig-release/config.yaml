@@ -5,44 +5,40 @@ dashboard_groups:
   dashboard_names:
   - sig-release-master-blocking
   - sig-release-master-informing
-  - sig-release-1.16-blocking
-  - sig-release-1.16-informing
-  - sig-release-1.16-all
-  - sig-release-1.15-blocking
-  - sig-release-1.15-informing
-  - sig-release-1.15-all
-  - sig-release-1.14-blocking
-  - sig-release-1.14-informing
-  - sig-release-1.14-all
-  - sig-release-1.13-blocking
-  - sig-release-1.13-informing
-  - sig-release-1.13-all
-  - sig-release-misc
+  - sig-release-1.32-blocking
+  - sig-release-1.32-informing
+  - sig-release-1.31-blocking
+  - sig-release-1.31-informing
+  - sig-release-1.30-blocking
+  - sig-release-1.30-informing
+  - sig-release-1.29-blocking
+  - sig-release-1.29-informing
+  - sig-release-releng-blocking
+  - sig-release-releng-informing
+  - sig-release-releng-presubmits
+  - sig-release-image-pushes
   - sig-release-publishing-bot
   - sig-release-release-notes-presubmits
+  - sig-release-job-config-errors
+  - sig-release-release-team-periodics
 
 # Dashboards
 
 dashboards:
-- name: sig-release-1.13-all
-- name: sig-release-1.13-blocking
-- name: sig-release-1.13-informing
-- name: sig-release-1.14-all
-- name: sig-release-1.14-blocking
-- name: sig-release-1.14-informing
-- name: sig-release-1.15-all
-- name: sig-release-1.15-blocking
-- name: sig-release-1.15-informing
-- name: sig-release-1.16-all
-- name: sig-release-1.16-blocking
-- name: sig-release-1.16-informing
 - name: sig-release-master-blocking
 - name: sig-release-master-informing
-  dashboard_tab:
-  - name: Conformance - OpenStack
-    test_group_name: ci-periodic-cloud-provider-openstack-acceptance-test-e2e-conformance
-    description: "OWNER: sig-openstack; Runs conformance tests using kubetest against latest kubernetes master with cloud-provider-openstack"
-- name: sig-release-misc
+- name: sig-release-1.32-blocking
+- name: sig-release-1.32-informing
+- name: sig-release-1.31-blocking
+- name: sig-release-1.31-informing
+- name: sig-release-1.30-blocking
+- name: sig-release-1.30-informing
+- name: sig-release-1.29-blocking
+- name: sig-release-1.29-informing
+- name: sig-release-releng-blocking
+- name: sig-release-releng-informing
+- name: sig-release-releng-presubmits
+- name: sig-release-image-pushes
 - name: sig-release-publishing-bot
 - name: sig-release-release-notes-presubmits
   dashboard_tab:
@@ -67,3 +63,5 @@ dashboards:
   - name: test
     test_group_name: pull-release-notes-test
     base_options: width=10
+- name: sig-release-job-config-errors
+- name: sig-release-release-team-periodics

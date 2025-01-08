@@ -1,42 +1,37 @@
 postsubmits:
   kubernetes/test-infra:
-  - name: post-test-infra-build-smoke
-    agent: knative-build
-    decorate: true
-    build_spec:
-      steps:
-      - name: first
-        image: busybox
-        args: ["echo", "hello"]
-      - name: second
-        image: busybox
-        args: ["echo", "world"]
-      - name: third
-        image: busybox
-        args: ["cat", "config/jobs/kubernetes/test-infra/test-infra-postsubmits.yaml"]
-    annotations:
-      testgrid-dashboards: sig-testing-prow
-      testgrid-tab-name: post-build-smoke
-      description: basic postsubmit to ensure build controller works correctly
-
-  - name: post-test-infra-bazel
+  - name: post-test-infra-test-all
+    cluster: eks-prow-build-cluster
     branches:
     - master
     decorate: true
     labels:
       preset-service-account: "true"
-      preset-bazel-scratch-dir: "true"
+      preset-dind-enabled: "true"
+      preset-kind-volume-mounts: "true"
     spec:
       containers:
-      - image: launcher.gcr.io/google/bazel:0.29.1
+      - image: gcr.io/k8s-staging-test-infra/kubekins-e2e:v20241230-3006692a6f-master
         command:
-        - hack/bazel.sh
+        - runner.sh
         args:
+        - make
         - test
-        - --config=ci
-        - --nobuild_tests_only
-        - //...
+        - verify
+        env:
+        # docker-in-docker needs privileged mode
+        securityContext:
+          privileged: true
+        resources:
+          requests:
+            # This job is very CPU intensive as building prow images in
+            # parallel
+            cpu: "14"
+            memory: "16Gi"
+          limits:
+            cpu: "14"
+            memory: "16Gi"
     annotations:
       testgrid-dashboards: sig-testing-misc
-      testgrid-tab-name: post-bazel
-      description: Runs bazel test //... on the test-infra repo on each commit
+      testgrid-tab-name: post-test-all
+      description: Runs 'make test verify' on the test-infra repo on each commit

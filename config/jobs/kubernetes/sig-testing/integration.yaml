@@ -1,97 +1,146 @@
 presubmits:
   kubernetes/kubernetes:
+  # this replaces the bootstrap / scenario based job going forward
   - name: pull-kubernetes-integration
+    cluster: eks-prow-build-cluster
     always_run: true
-    labels:
-      preset-service-account: "true"
-      preset-dind-enabled: "true"
-    spec:
-      containers:
-      - image: gcr.io/k8s-testimages/bootstrap:v20190828-3328954
-        args:
-        - "--job=$(JOB_NAME)"
-        - "--repo=k8s.io/$(REPO_NAME)=$(PULL_REFS)"
-        - "--service-account=/etc/service-account/service-account.json"
-        - "--upload=gs://kubernetes-jenkins/pr-logs"
-        - "--timeout=60"
-        - --scenario=kubernetes_verify
-        - --
-        - "--branch=${PULL_BASE_REF}"
-        - --prow
-        # docker-in-docker needs privileged mode
-        securityContext:
-          privileged: true
-        resources:
-          requests:
-            cpu: 4
+    decorate: true
+    skip_branches:
+    - release-\d+.\d+ # per-release job
     annotations:
+      fork-per-release: "true"
       testgrid-num-failures-to-alert: '10'
       testgrid-alert-stale-results-hours: '24'
       testgrid-create-test-group: 'true'
-  # TODO(krzyzacy): add branches once this works
-  # TODO(krzyzacy): Consider combine kubekins-e2e and kubekins-test
-  - name: pull-kubernetes-integration-podutil
-    always_run: false
-    decorate: true
-    branches:
-    - master
     path_alias: k8s.io/kubernetes
     labels:
       preset-service-account: "true"
       preset-dind-enabled: "true"
     spec:
       containers:
-      - image: gcr.io/k8s-testimages/kubekins-e2e:latest-master
-        imagePullPolicy: Always
+      - image: gcr.io/k8s-staging-test-infra/kubekins-e2e:v20241230-3006692a6f-master
         command:
         - runner.sh
+        env:
+        - name: KUBE_INTEGRATION_TEST_MAX_CONCURRENCY
+          value: "8"
+        - name: KUBE_TIMEOUT
+          value: "-timeout=1h30m"
         args:
         - ./hack/jenkins/test-dockerized.sh
-        env:
-        - name: KUBE_FORCE_VERIFY_CHECKS
-          value: "n"
-        - name: KUBE_VERIFY_GIT_BRANCH
-          value: master
-        - name: REPO_DIR
-          value: /workspace/k8s.io/kubernetes
         # docker-in-docker needs privileged mode
         securityContext:
           privileged: true
         resources:
+          limits:
+            cpu: 8
+            memory: 20Gi
           requests:
-            cpu: 4
+            cpu: 8
+            memory: 20Gi
+  - name: pull-kubernetes-integration-go-compatibility
+    cluster: k8s-infra-prow-build
+    always_run: true
+    decorate: true
+    skip_branches:
+    - .* # per-release job
     annotations:
-      testgrid-dashboards: sig-testing-canaries
+      fork-per-release: "true"
+      fork-per-release-replacements: "GO_VERSION= -> GO_VERSION={{.GoVersion}}"
+      testgrid-create-test-group: 'true'
+      description: run with GO_VERSION set to the original go version used for this branch
+    path_alias: k8s.io/kubernetes
+    labels:
+      preset-service-account: "true"
+      preset-dind-enabled: "true"
+    spec:
+      containers:
+      - image: gcr.io/k8s-staging-test-infra/kubekins-e2e:v20241230-3006692a6f-master
+        command:
+        - runner.sh
+        env:
+        - name: GO_VERSION
+          value: ""
+        args:
+        - ./hack/jenkins/test-dockerized.sh
+        # docker-in-docker needs privileged mode
+        securityContext:
+          privileged: true
+        resources:
+          limits:
+            cpu: 6
+            memory: 15Gi
+          requests:
+            cpu: 6
+            memory: 15Gi
+  - name: pull-kubernetes-integration-go-canary
+    cluster: k8s-infra-prow-build
+    always_run: false
+    skip_report: false
+    decorate: true
+    annotations:
       testgrid-num-failures-to-alert: '10'
       testgrid-alert-stale-results-hours: '24'
+      testgrid-create-test-group: 'true'
+      testgrid-dashboards: sig-release-releng-informing, sig-testing-canaries
+    path_alias: k8s.io/kubernetes
+    labels:
+      preset-service-account: "true"
+      preset-dind-enabled: "true"
+    spec:
+      containers:
+      - image: gcr.io/k8s-staging-test-infra/kubekins-e2e:v20241230-3006692a6f-go-canary
+        command:
+        - runner.sh
+        args:
+        - ./hack/jenkins/test-dockerized.sh
+        # docker-in-docker needs privileged mode
+        securityContext:
+          privileged: true
+        resources:
+          limits:
+            cpu: 6
+            memory: 15Gi
+          requests:
+            cpu: 6
+            memory: 15Gi
 periodics:
 - interval: 1h
+  cluster: eks-prow-build-cluster
   name: ci-kubernetes-integration-master
+  decorate: true
+  extra_refs:
+  - org: kubernetes
+    repo: kubernetes
+    base_ref: master
+    path_alias: k8s.io/kubernetes
   labels:
     preset-service-account: "true"
     preset-dind-enabled: "true"
   annotations:
     fork-per-release: "true"
     fork-per-release-periodic-interval: 2h 2h 6h 24h
-    fork-per-release-generic-suffix: "true"
-    testgrid-dashboards: sig-release-master-blocking, google-unit
+    testgrid-dashboards: sig-release-master-blocking
     testgrid-tab-name: integration-master
-    testgrid-alert-email: kubernetes-release-team@googlegroups.com
+    testgrid-alert-email: release-team@kubernetes.io
     description: "Ends up running: make test-cmd test-integration"
   spec:
     containers:
-    - image: gcr.io/k8s-testimages/bootstrap:v20190828-3328954
+    - image: gcr.io/k8s-staging-test-infra/kubekins-e2e:v20241230-3006692a6f-master
+      command:
+      - runner.sh
       args:
-      - --repo=k8s.io/kubernetes
-      - --timeout=100
-      - --scenario=kubernetes_verify
-      - --
-      - --branch=master
-      - --force
-      - --prow
+      - ./hack/jenkins/test-dockerized.sh
+      env:
+      - name: SHORT
+        value: --short=false
       # docker-in-docker needs privileged mode
       securityContext:
         privileged: true
       resources:
+        limits:
+          cpu: 6
+          memory: 20Gi
         requests:
-          cpu: 4
+          cpu: 6
+          memory: 20Gi

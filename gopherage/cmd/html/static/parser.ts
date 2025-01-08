@@ -29,21 +29,31 @@ export interface Block {
 }
 
 export class FileCoverage {
-  public blocks: Block[] = [];
+  private blocks: Map<string, Block> = new Map<string, Block>();
 
   constructor(readonly filename: string, readonly fileNumber: number) {}
 
   public addBlock(block: Block) {
-    this.blocks.push(block);
+    const k = this.keyForBlock(block);
+    const oldBlock = this.blocks.get(k);
+    if (oldBlock) {
+      oldBlock.hits += block.hits;
+    } else {
+      this.blocks.set(k, block);
+    }
   }
 
   get totalStatements(): number {
-    return this.blocks.reduce((acc, b) => acc + b.statements, 0);
+    return reduce(this.blocks.values(), (acc, b) => acc + b.statements, 0);
   }
 
   get coveredStatements(): number {
-    return this.blocks.reduce(
-        (acc, b) => acc + (b.hits > 0 ? b.statements : 0), 0);
+    return reduce(this.blocks.values(),
+      (acc, b) => acc + (b.hits > 0 ? b.statements : 0), 0);
+  }
+
+  private keyForBlock(block: Block): string {
+    return `${block.start.line}.${block.start.col},${block.end.line}.${block.end.col}`;
   }
 }
 
@@ -62,7 +72,7 @@ export class Coverage {
 
   public getFilesWithPrefix(prefix: string): Map<string, FileCoverage> {
     return new Map(filter(
-        this.files.entries(), ([k]) => k.startsWith(this.prefix + prefix)));
+      this.files.entries(), ([k]) => k.startsWith(this.prefix + prefix)));
   }
 
   public getCoverageForPrefix(prefix: string): Coverage {
@@ -78,7 +88,7 @@ export class Coverage {
   get children(): Map<string, Coverage> {
     const children = new Map();
     for (const path of this.files.keys()) {
-      // tslint:disable-next-line:prefer-const
+      // eslint-disable-next-line prefer-const
       let [dir, rest] = path.substr(this.prefix.length).split('/', 2);
       if (!children.has(dir)) {
         if (rest) {
@@ -92,8 +102,8 @@ export class Coverage {
 
   get basename(): string {
     if (this.prefix.endsWith('/')) {
-      return this.prefix.substring(0, this.prefix.length - 1).split('/').pop() +
-          '/';
+      return `${this.prefix.substring(0, this.prefix.length - 1).split('/').pop()
+      }/`;
     }
     return this.prefix.split('/').pop()!;
   }
@@ -104,7 +114,7 @@ export class Coverage {
 
   get coveredStatements(): number {
     return reduce(
-        this.files.values(), (acc, f) => acc + f.coveredStatements, 0);
+      this.files.values(), (acc, f) => acc + f.coveredStatements, 0);
   }
 
   get totalFiles(): number {
@@ -113,8 +123,8 @@ export class Coverage {
 
   get coveredFiles(): number {
     return reduce(
-        this.files.values(),
-        (acc, f) => acc + (f.coveredStatements > 0 ? 1 : 0), 0);
+      this.files.values(),
+      (acc, f) => acc + (f.coveredStatements > 0 ? 1 : 0), 0);
   }
 }
 
@@ -125,6 +135,21 @@ export function parseCoverage(content: string): Coverage {
   if (modeLabel !== 'mode') {
     throw new Error('Expected to start with mode line.');
   }
+
+  // Well-formed coverage files are already sorted alphabetically, but Kubernetes'
+  // `make test` produces ill-formed coverage files. This does actually matter, so
+  // sort it ourselves.
+  lines.sort((a, b) => {
+    a = a.split(':', 2)[0];
+    b = b.split(':', 2)[0];
+    if (a < b) {
+      return -1;
+    } else if (a > b) {
+      return 1;
+    } else {
+      return 0;
+    }
+  });
 
   const coverage = new Coverage(mode);
   let fileCounter = 0;

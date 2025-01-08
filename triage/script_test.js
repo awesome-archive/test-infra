@@ -25,6 +25,24 @@ describe('sparkLinePath', () => {
     expect('handles scaling', 'M0,8h0V7h2V6h1V4h1V0h1V8', [2,4,8,16,32], 1, 8);
 })
 
+describe('spyglassURLForBuild', () => {
+    function expect(name, expected, ...args) {
+        it(name, function() {
+            assert.deepEqual(render.spyglassURLForBuild(...args), expected);
+        });
+    }
+    builds = {
+      jobPaths: {
+        'pr:pull-kubernetes-verify': 'gs://kubernetes-ci-logs/pr-logs/pull/122078/pull-kubernetes-verify',
+        'pr:cloud-provider-gcp-e2e-full': 'gs://kubernetes-ci-logs/pr-logs/pull/cloud-provider-gcp/636/cloud-provider-gcp-e2e-full',
+        'pr:pull-cluster-api-provider-azure-e2e': 'gs://kubernetes-ci-logs/pr-logs/pull/kubernetes-sigs_cluster-api-provider-azure/4302/pull-cluster-api-provider-azure-e2e',
+      }
+    };
+    expect('handles k/k jobs', 'https://prow.k8s.io/view/gs/kubernetes-ci-logs/pr-logs/pull/122272/pull-kubernetes-verify/1734547176656211968', {job: 'pr:pull-kubernetes-verify', number: '1734547176656211968', pr: '122272'});
+    expect('handles non-k/k jobs in the kubernetes org', 'https://prow.k8s.io/view/gs/kubernetes-ci-logs/pr-logs/pull/cloud-provider-gcp/638/cloud-provider-gcp-e2e-full/1734630461432401920', {job: 'pr:cloud-provider-gcp-e2e-full', number: '1734630461432401920', pr: '638'});
+    expect('handles non-kubernetes org jobs', 'https://prow.k8s.io/view/gs/kubernetes-ci-logs/pr-logs/pull/kubernetes-sigs_cluster-api-provider-azure/4345/pull-cluster-api-provider-azure-e2e/1734613965410930688', {job: 'pr:pull-cluster-api-provider-azure-e2e', number: '1734613965410930688', pr: '4345'});
+})
+
 describe('Clusters', () => {
     describe('refilter', () => {
         function expect(name, expected, clustered, opts) {
@@ -37,7 +55,7 @@ describe('Clusters', () => {
             {name: 'volume', jobs: [{name: 'cure', builds: [1, 2]}]},
         ]};
         let spam = {text: 'spam', key: 'spam', id: '5678', owner: 'ui', tests: [
-            {name: 'networking', jobs: [{name: 'g', builds: [2]}]},
+            {name: 'networking', jobs: [{name: 'gcure', builds: [2]}]},
         ]};
         let pr = {text: 'bam', key: 'bam', id: '9abc', tests: [
             {name: 'new', jobs: [{name: 'pr:verify', builds: [3]}]},
@@ -45,9 +63,9 @@ describe('Clusters', () => {
         let first = {text: 'afirst', key: 'afirst', id: 'def0', tests: [
             {name: 'something', jobs: [{name: 'firstjob', builds: [5, 6]}]},
         ]};
-        expect('filters by text', [ham], [ham, spam], {reText: /ham/im, ci: true});
-        expect('filters by test', [ham], [ham, spam], {reTest: /volume/im, ci: true});
-        expect('filters by job', [ham], [ham, spam], {reJob: /cure/im, ci: true});
+        expect('filters by text', [ham, spam], [ham, spam, pr], {reText: /am/im, reXText: /b/im, ci: true});
+        expect('filters by test', [spam], [ham, spam, first], {reTest: /ing/im, reXTest: /some/im, ci: true});
+        expect('filters by job', [ham], [ham, spam], {reJob: /cure/im, reXJob: /g/im, ci: true});
         expect('filters by sig', [ham], [ham, spam], {sig: ['node'], ci: true});
         expect('shows PRs when demanded', [pr], [ham, spam, pr], {pr: true});
         expect('hides PRs otherwise', [ham, spam], [ham, spam, pr], {ci: true});

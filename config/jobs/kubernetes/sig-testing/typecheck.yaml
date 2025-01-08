@@ -1,6 +1,7 @@
 presubmits:
   kubernetes/kubernetes:
   - name: pull-kubernetes-typecheck
+    cluster: eks-prow-build-cluster
     path_alias: "k8s.io/kubernetes"
     decorate: true
     always_run: true
@@ -10,12 +11,22 @@ presubmits:
     - release-\d+.\d+ # per-release job
     annotations:
       fork-per-release: "true"
+      testgrid-alert-stale-results-hours: "24"
+      testgrid-create-test-group: "true"
+      testgrid-num-failures-to-alert: "10"
     spec:
       containers:
       - name: main
         command:
         - make
-        image: gcr.io/k8s-testimages/kubekins-e2e:v20190920-5a67b1f-master
+        image: gcr.io/k8s-staging-test-infra/kubekins-e2e:v20241230-3006692a6f-master
+        resources:
+          limits:
+            cpu: 5
+            memory: 32Gi
+          requests:
+            cpu: 5
+            memory: 32Gi
         args:
         - verify
         env:

@@ -4,12 +4,11 @@ options:
 
 # Oncallers with context on this
 reviewers:
-- Katharine
+- ameukam
+- BenTheElder
+- dims
 
 # All oncallers
 approvers:
-- chases2
-- cjwagner
-- fejta
-- Katharine
-- michelle192837
+- test-infra-oncall
+- sig-k8s-infra-oncall
